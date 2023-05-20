@@ -129,6 +129,14 @@ func (s *Server) handleOp(ctx context.Context, op repomgr.EventKind, seq int64, 
 			if err := s.indexProfile(ctx, u, rec); err != nil {
 				return fmt.Errorf("indexing profile: %w", err)
 			}
+		case *bsky.FeedLike:
+			if err := s.handleLike(ctx, u, rec); err != nil {
+				return fmt.Errorf("handling like: %w", err)
+			}
+		case *bsky.FeedRepost:
+			if err := s.handleRepost(ctx, u, rec); err != nil {
+				return fmt.Errorf("handling repost: %w", err)
+			}
 		default:
 		}
 
@@ -138,6 +146,7 @@ func (s *Server) handleOp(ctx context.Context, op repomgr.EventKind, seq int64, 
 			return err
 		}
 
+		// Not handling like/repost deletes because it requires individually tracking *every* single like
 		switch {
 		// TODO: handle profile deletes, its an edge case, but worth doing still
 		case strings.Contains(path, "app.bsky.feed.post"):

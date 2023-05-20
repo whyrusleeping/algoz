@@ -19,15 +19,46 @@ import (
 	cli "github.com/urfave/cli/v2"
 
 	gorm "gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var log = logging.Logger("algoz")
 
 type PostRef struct {
 	gorm.Model
-	Cid string
-	Tid string `gorm:"index"`
-	Uid uint   `gorm:"index"`
+	Cid        string
+	Rkey       string `gorm:"index"`
+	Uid        uint   `gorm:"index"`
+	NotFound   bool
+	Likes      int
+	Reposts    int
+	Replies    int
+	ThreadSize int
+}
+
+type Feed struct {
+	gorm.Model
+	Name string `gorm:"unique"`
+}
+
+type FeedIncl struct {
+	gorm.Model
+	Feed uint `gorm:"uniqueIndex:idx_feed_post"`
+	Post uint `gorm:"uniqueIndex:idx_feed_post"`
+}
+
+type FeedLike struct {
+	ID   uint   `gorm:"primarykey"`
+	User uint   `gorm:"index"`
+	Rkey string `gorm:"index"`
+	Ref  uint
+}
+
+type FeedRepost struct {
+	ID   uint   `gorm:"primarykey"`
+	User uint   `gorm:"index"`
+	Rkey string `gorm:"index"`
+	Ref  uint
 }
 
 type User struct {
@@ -35,6 +66,8 @@ type User struct {
 	Did       string `gorm:"index"`
 	Handle    string
 	LastCrawl string
+
+	Blessed bool
 }
 
 type LastSeq struct {
@@ -99,6 +132,9 @@ var runCmd = &cli.Command{
 		log.Info("Migrating database")
 		db.AutoMigrate(&User{})
 		db.AutoMigrate(&LastSeq{})
+		db.AutoMigrate(&PostRef{})
+		db.AutoMigrate(&FeedIncl{})
+		db.AutoMigrate(&Feed{})
 
 		log.Infof("Configuring HTTP server")
 		e := echo.New()
@@ -134,9 +170,16 @@ var runCmd = &cli.Command{
 			userCache: ucache,
 		}
 
-		e.Use(middleware.CORS())
+		// Create some initial feed definitions
+		if err := s.db.FirstOrCreate(&Feed{
+			Name: "coolstuff",
+		}).Error; err != nil {
+			return err
+		}
 
+		e.Use(middleware.CORS())
 		e.GET("/xrpc/app.bsky.feed.getFeedSkeleton", s.handleGetFeedSkeleton)
+		e.GET("/xrpc/app.bsky.feed.describeFeedGenerator", s.handleDescribeFeedGenerator)
 		//e.GET(".well-known/did.json", s.handleServeDidDoc)
 
 		go func() {
@@ -157,6 +200,7 @@ type FeedItem struct {
 }
 
 func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
+	ctx := e.Request().Context()
 	feed := e.QueryParam("feed")
 
 	puri, err := util.ParseAtUri(feed)
@@ -164,18 +208,59 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 		return err
 	}
 
-	_ = puri
+	if puri.Rkey == "coolstuff" {
+		feed, err := s.getCoolstuff(ctx)
+		if err != nil {
+			return err
+		}
 
-	out := []FeedItem{
-		FeedItem{
-			Post: "at://did:plc:vpkhqolt662uhesyj6nxm7ys/app.bsky.feed.post/3jw2emriitk2u",
-		},
+		return e.JSON(200, feed)
 	}
 
-	return e.JSON(200, out)
+	return &echo.HTTPError{
+		Code:    400,
+		Message: "no such feed",
+	}
 }
 
-/* // TODO: simplify a lot of things by also hosting our own did:web document
+func (s *Server) getCoolstuff(ctx context.Context) ([]FeedItem, error) {
+	f, err := s.getFeedRef(ctx, "coolstuff")
+	if err != nil {
+		return nil, err
+	}
+
+	var posts []PostRef
+	if err := s.db.Table("feed_incls").Where("feed_incls.feed = ?", f.ID).Joins("INNER JOIN post_refs on post_refs.id = feed_incls.post").Select("post_refs.*").Order("post_refs.created_at desc").Limit(50).Find(&posts).Error; err != nil {
+		return nil, err
+	}
+
+	var out []FeedItem
+	for _, p := range posts {
+		uri, err := s.uriForPost(ctx, &p)
+		if err != nil {
+			return nil, err
+		}
+
+		out = append(out, FeedItem{Post: uri})
+	}
+
+	return out, nil
+}
+
+func (s *Server) uriForPost(ctx context.Context, pr *PostRef) (string, error) {
+	var u User
+	if err := s.db.First(&u, "id = ?", pr.Uid).Error; err != nil {
+		return "", err
+	}
+
+	return "at://" + u.Did + "/app.bsky.feed.post/" + pr.Rkey, nil
+}
+
+func (s *Server) handleDescribeFeedGenerator(e echo.Context) error {
+	panic("NYI")
+}
+
+/* // TODO: simplify a lot of things (maybe) by also hosting our own did:web document
 func (s *Server) handleServeDidDoc(e echo.Context) error {
 	// TODO:
 	return nil
@@ -189,22 +274,94 @@ func (s *Server) deletePost(ctx context.Context, u *User, path string) error {
 	return nil
 }
 
-func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, tid string, pcid cid.Cid) error {
-	log.Infof("indexing post: %s", tid)
+func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, rkey string, pcid cid.Cid) error {
+	log.Infof("indexing post: %s", rkey)
 
-	if err := s.db.Create(&PostRef{
-		Cid: pcid.String(),
-		Tid: tid,
-		Uid: u.ID,
-	}).Error; err != nil {
+	pref := &PostRef{
+		Cid:  pcid.String(),
+		Rkey: rkey,
+		Uid:  u.ID,
+	}
+	// TODO: update if already exists
+	if err := s.db.Create(pref).Error; err != nil {
 		return err
+	}
+
+	if rec.Reply != nil {
+		if err := s.incrementReplyTo(ctx, rec.Reply.Parent.Uri); err != nil {
+			return err
+		}
+
+		if err := s.incrementReplyRoot(ctx, rec.Reply.Root.Uri); err != nil {
+			return err
+		}
+	}
+
+	if u.Blessed {
+		if err := s.addPostToFeed(ctx, "coolstuff", pref); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func (s *Server) indexProfile(ctx context.Context, u *User, rec *bsky.ActorProfile) error {
+func (s *Server) incrementReplyTo(ctx context.Context, uri string) error {
+	pref, err := s.getPostByUri(ctx, uri)
+	if err != nil {
+		return err
+	}
 
+	if err := s.db.Model(&PostRef{}).Where("id = ?", pref.ID).Update("replies", gorm.Expr("replies + 1")).Error; err != nil {
+		return err
+	}
+
+	return err
+}
+
+func (s *Server) getPostByUri(ctx context.Context, uri string) (*PostRef, error) {
+	puri, err := util.ParseAtUri(uri)
+	if err != nil {
+		return nil, err
+	}
+
+	u, err := s.getOrCreateUser(ctx, puri.Did)
+	if err != nil {
+		return nil, err
+	}
+
+	var ref PostRef
+	if err := s.db.Find(&ref, "uid = ? AND rkey = ?", u.ID, puri.Rkey).Error; err != nil {
+		return nil, err
+	}
+
+	if ref.ID == 0 {
+		ref.Rkey = puri.Rkey
+		ref.Uid = u.ID
+		ref.NotFound = true
+
+		if err := s.db.Create(&ref).Error; err != nil {
+			return nil, err
+		}
+	}
+
+	return &ref, nil
+}
+
+func (s *Server) incrementReplyRoot(ctx context.Context, uri string) error {
+	pref, err := s.getPostByUri(ctx, uri)
+	if err != nil {
+		return err
+	}
+
+	if err := s.db.Model(&PostRef{}).Where("id = ?", pref.ID).Update("thread_size", gorm.Expr("thread_size + 1")).Error; err != nil {
+		return err
+	}
+
+	return err
+}
+
+func (s *Server) indexProfile(ctx context.Context, u *User, rec *bsky.ActorProfile) error {
 	n := ""
 	if rec.DisplayName != nil {
 		n = *rec.DisplayName
@@ -216,5 +373,64 @@ func (s *Server) indexProfile(ctx context.Context, u *User, rec *bsky.ActorProfi
 }
 
 func (s *Server) updateUserHandle(ctx context.Context, did string, handle string) error {
+	u, err := s.getOrCreateUser(ctx, did)
+	if err != nil {
+		return err
+	}
+
+	return s.db.Model(&User{}).Where("id = ?", u.ID).Update("handle", handle).Error
+}
+
+func (s *Server) handleLike(ctx context.Context, u *User, rec *bsky.FeedLike) error {
+	p, err := s.getPostByUri(ctx, rec.Subject.Uri)
+	if err != nil {
+		return err
+	}
+
+	if err := s.db.Model(&PostRef{}).Where("id = ?", p.ID).Update("likes", gorm.Expr("likes + 1")).Error; err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Server) getFeedRef(ctx context.Context, feed string) (*Feed, error) {
+	var f Feed
+	if err := s.db.First(&f, "name = ?", feed).Error; err != nil {
+		return nil, err
+	}
+
+	return &f, nil
+}
+
+func (s *Server) addPostToFeed(ctx context.Context, feed string, p *PostRef) error {
+	f, err := s.getFeedRef(ctx, feed)
+	if err != nil {
+		return err
+	}
+
+	if err := s.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "feed"}, {Name: "post"}},
+		DoNothing: true,
+	}).Create(&FeedIncl{
+		Post: p.ID,
+		Feed: f.ID,
+	}).Error; err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Server) handleRepost(ctx context.Context, u *User, rec *bsky.FeedRepost) error {
+	p, err := s.getPostByUri(ctx, rec.Subject.Uri)
+	if err != nil {
+		return err
+	}
+
+	if err := s.db.Model(&PostRef{}).Where("id = ?", p.ID).Update("reposts", gorm.Expr("reposts + 1")).Error; err != nil {
+		return err
+	}
+
 	return nil
 }
