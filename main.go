@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	api "github.com/bluesky-social/indigo/api"
 	bsky "github.com/bluesky-social/indigo/api/bsky"
@@ -27,8 +28,8 @@ var log = logging.Logger("algoz")
 type PostRef struct {
 	gorm.Model
 	Cid        string
-	Rkey       string `gorm:"index"`
-	Uid        uint   `gorm:"index"`
+	Rkey       string `gorm:"uniqueIndex:idx_post_rkeyuid"`
+	Uid        uint   `gorm:"uniqueIndex:idx_post_rkeyuid"`
 	NotFound   bool
 	Likes      int
 	Reposts    int
@@ -38,7 +39,8 @@ type PostRef struct {
 
 type Feed struct {
 	gorm.Model
-	Name string `gorm:"unique"`
+	Name        string `gorm:"unique"`
+	Description string
 }
 
 type FeedIncl struct {
@@ -172,7 +174,15 @@ var runCmd = &cli.Command{
 
 		// Create some initial feed definitions
 		if err := s.db.FirstOrCreate(&Feed{
-			Name: "coolstuff",
+			Name:        "coolstuff",
+			Description: "posts by specific cool people, maybe",
+		}).Error; err != nil {
+			return err
+		}
+
+		if err := s.db.FirstOrCreate(&Feed{
+			Name:        "mostpop",
+			Description: "most popular posts for every ten minutes",
 		}).Error; err != nil {
 			return err
 		}
@@ -208,19 +218,77 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 		return err
 	}
 
-	if puri.Rkey == "coolstuff" {
+	switch puri.Rkey {
+	case "coolstuff":
 		feed, err := s.getCoolstuff(ctx)
 		if err != nil {
 			return err
 		}
 
 		return e.JSON(200, feed)
+	case "mostpop":
+		feed, err := s.getMostPop(ctx)
+		if err != nil {
+			return err
+		}
+
+		return e.JSON(200, feed)
+	default:
+		return &echo.HTTPError{
+			Code:    400,
+			Message: "no such feed",
+		}
 	}
 
-	return &echo.HTTPError{
-		Code:    400,
-		Message: "no such feed",
+}
+
+func (s *Server) getMostPop(ctx context.Context) ([]FeedItem, error) {
+	// Get current time
+	now := time.Now()
+
+	// Get the time 6 hours ago
+	sixHoursAgo := now.Add(-6 * time.Hour)
+
+	// Convert to SQLite-compatible datetime strings
+	nowStr := now.Format("2006-01-02 15:04:05")
+	sixHoursAgoStr := sixHoursAgo.Format("2006-01-02 15:04:05")
+
+	// Raw SQL query
+	query := `
+		SELECT *
+		FROM post_refs
+		WHERE id IN (
+			SELECT id
+			FROM (
+				SELECT id, MAX(likes), strftime('%H:%M', created_at) AS interval
+				FROM post_refs
+				WHERE created_at BETWEEN ? AND ?
+				GROUP BY interval
+			)
+		)
+	`
+
+	// Execute query and scan the results into a PostRef slice
+	var posts []PostRef
+	if err := s.db.Raw(query, sixHoursAgoStr, nowStr).Scan(&posts).Error; err != nil {
+		return nil, err
 	}
+
+	return s.postsToFeed(ctx, posts)
+}
+
+func (s *Server) postsToFeed(ctx context.Context, posts []PostRef) ([]FeedItem, error) {
+	var out []FeedItem
+	for _, p := range posts {
+		uri, err := s.uriForPost(ctx, &p)
+		if err != nil {
+			return nil, err
+		}
+
+		out = append(out, FeedItem{Post: uri})
+	}
+
+	return out, nil
 }
 
 func (s *Server) getCoolstuff(ctx context.Context) ([]FeedItem, error) {
@@ -234,17 +302,7 @@ func (s *Server) getCoolstuff(ctx context.Context) ([]FeedItem, error) {
 		return nil, err
 	}
 
-	var out []FeedItem
-	for _, p := range posts {
-		uri, err := s.uriForPost(ctx, &p)
-		if err != nil {
-			return nil, err
-		}
-
-		out = append(out, FeedItem{Post: uri})
-	}
-
-	return out, nil
+	return s.postsToFeed(ctx, posts)
 }
 
 func (s *Server) uriForPost(ctx context.Context, pr *PostRef) (string, error) {
@@ -278,12 +336,17 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, rke
 	log.Infof("indexing post: %s", rkey)
 
 	pref := &PostRef{
-		Cid:  pcid.String(),
-		Rkey: rkey,
-		Uid:  u.ID,
+		Cid:      pcid.String(),
+		Rkey:     rkey,
+		Uid:      u.ID,
+		NotFound: false,
 	}
-	// TODO: update if already exists
-	if err := s.db.Create(pref).Error; err != nil {
+
+	// Update columns to default value on `id` conflict
+	if err := s.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "uid"}, {Name: "rkey"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{"cid": "not_found"}),
+	}).Create(pref).Error; err != nil {
 		return err
 	}
 
@@ -297,7 +360,7 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, rke
 		}
 	}
 
-	if u.Blessed {
+	if u.Blessed || true {
 		if err := s.addPostToFeed(ctx, "coolstuff", pref); err != nil {
 			return err
 		}
