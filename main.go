@@ -26,7 +26,9 @@ import (
 var log = logging.Logger("algoz")
 
 type PostRef struct {
-	gorm.Model
+	ID        uint      `gorm:"primarykey"`
+	CreatedAt time.Time `gorm:"index"`
+
 	Cid        string
 	Rkey       string `gorm:"uniqueIndex:idx_post_rkeyuid"`
 	Uid        uint   `gorm:"uniqueIndex:idx_post_rkeyuid"`

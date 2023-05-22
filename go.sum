@@ -8,6 +8,10 @@ github.com/benbjohnson/clock v1.3.0 h1:ip6w0uFQkncKQ979AypyG0ER7mqUSBdKLOgAle/AT
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/bluesky-social/indigo v0.0.0-20230510053547-696c25279dbe h1:gxJskpDouUKi8N9quszyTfD3nSyVAfGq5y07AB2CKJo=
 github.com/bluesky-social/indigo v0.0.0-20230510053547-696c25279dbe/go.mod h1:BpEzHu5qbBSWPFxjfUX7nJE/fbQJ4IOWyDEm9/ziE0Y=
+github.com/bluesky-social/indigo v0.0.0-20230521020811-8be05e4183a0 h1:2gxksZ3wqOkzp9BGuIsAELSgacegPUTH31UZcGIWDWI=
+github.com/bluesky-social/indigo v0.0.0-20230521020811-8be05e4183a0/go.mod h1:S50X3gjHMnPSmdn1y+/9EKkHyJGaGkWreLpY8AIMfs4=
+github.com/bluesky-social/indigo v0.0.0-20230522212813-061368a7ccdd h1:1Ivf3agaEtwjfBspyxK/G8T3c9XoNJJ476XPFkWW+mQ=
+github.com/bluesky-social/indigo v0.0.0-20230522212813-061368a7ccdd/go.mod h1:S50X3gjHMnPSmdn1y+/9EKkHyJGaGkWreLpY8AIMfs4=
 github.com/btcsuite/btcd v0.0.0-20190213025234-306aecffea32/go.mod h1:DrZx5ec/dmnfpw9KyYoQyYo7d0KEvTkk/5M/vbZjAr8=
 github.com/btcsuite/btcd v0.0.0-20190523000118-16327141da8c/go.mod h1:3J08xEfcugPacsc34/LKRU2yO7YmuT8yt28J8k2+rrI=
 github.com/btcsuite/btclog v0.0.0-20170628155309-84c8d2346e9f/go.mod h1:TdznJufoqS23FtqVCzL0ZqgP5MqXbb4fg/WgDys70nA=

@@ -3,7 +3,7 @@ module github.com/whyrusleeping/algoz
 go 1.20
 
 require (
-	github.com/bluesky-social/indigo v0.0.0-20230510053547-696c25279dbe
+	github.com/bluesky-social/indigo v0.0.0-20230522212813-061368a7ccdd
 	github.com/gorilla/websocket v1.5.0
 	github.com/hashicorp/golang-lru v0.5.4
 	github.com/ipfs/go-cid v0.4.1

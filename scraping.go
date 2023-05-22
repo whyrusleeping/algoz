@@ -47,8 +47,10 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("events dial failed: %w", err)
 	}
 
-	return events.HandleRepoStream(ctx, con, &events.RepoStreamCallbacks{
-		RepoCommit: func(evt *comatproto.SyncSubscribeRepos_Commit) error {
+	pool := events.NewConsumerPool(8, 32, func(ctx context.Context, xe *events.XRPCStreamEvent) error {
+		switch {
+		case xe.RepoCommit != nil:
+			evt := xe.RepoCommit
 			if evt.TooBig && evt.Prev != nil {
 				log.Errorf("skipping non-genesis too big events for now: %d", evt.Seq)
 				return nil
@@ -99,17 +101,21 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 
 			return nil
-
-		},
-		RepoHandle: func(evt *comatproto.SyncSubscribeRepos_Handle) error {
+		case xe.RepoHandle != nil:
+			evt := xe.RepoHandle
 			if err := s.updateUserHandle(ctx, evt.Did, evt.Handle); err != nil {
 				log.Errorf("failed to update user handle: %s", err)
 			}
 			return nil
-		},
+		default:
+			return nil
+		}
 	})
+	if err != nil {
+		return err
+	}
 
-	return nil
+	return events.HandleRepoStream(ctx, con, pool)
 }
 
 // handleOp receives every incoming repo event and is where indexing logic lives
