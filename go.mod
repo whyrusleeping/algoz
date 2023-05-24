@@ -3,7 +3,7 @@ module github.com/whyrusleeping/algoz
 go 1.20
 
 require (
-	github.com/bluesky-social/indigo v0.0.0-20230522212813-061368a7ccdd
+	github.com/bluesky-social/indigo v0.0.0-20230524015400-d1ff456cff72
 	github.com/gorilla/websocket v1.5.0
 	github.com/hashicorp/golang-lru v0.5.4
 	github.com/ipfs/go-cid v0.4.1
@@ -98,5 +98,3 @@ require (
 	gorm.io/driver/sqlite v1.4.4 // indirect
 	lukechampine.com/blake3 v1.1.7 // indirect
 )
-
-replace github.com/bluesky-social/indigo => ../gosky

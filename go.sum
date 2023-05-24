@@ -12,6 +12,8 @@ github.com/bluesky-social/indigo v0.0.0-20230521020811-8be05e4183a0 h1:2gxksZ3wq
 github.com/bluesky-social/indigo v0.0.0-20230521020811-8be05e4183a0/go.mod h1:S50X3gjHMnPSmdn1y+/9EKkHyJGaGkWreLpY8AIMfs4=
 github.com/bluesky-social/indigo v0.0.0-20230522212813-061368a7ccdd h1:1Ivf3agaEtwjfBspyxK/G8T3c9XoNJJ476XPFkWW+mQ=
 github.com/bluesky-social/indigo v0.0.0-20230522212813-061368a7ccdd/go.mod h1:S50X3gjHMnPSmdn1y+/9EKkHyJGaGkWreLpY8AIMfs4=
+github.com/bluesky-social/indigo v0.0.0-20230524015400-d1ff456cff72 h1:7Myqib7abbUgGh2iv4hG+qifBaDvPXVXfpJB0Pc9aHQ=
+github.com/bluesky-social/indigo v0.0.0-20230524015400-d1ff456cff72/go.mod h1:S50X3gjHMnPSmdn1y+/9EKkHyJGaGkWreLpY8AIMfs4=
 github.com/btcsuite/btcd v0.0.0-20190213025234-306aecffea32/go.mod h1:DrZx5ec/dmnfpw9KyYoQyYo7d0KEvTkk/5M/vbZjAr8=
 github.com/btcsuite/btcd v0.0.0-20190523000118-16327141da8c/go.mod h1:3J08xEfcugPacsc34/LKRU2yO7YmuT8yt28J8k2+rrI=
 github.com/btcsuite/btclog v0.0.0-20170628155309-84c8d2346e9f/go.mod h1:TdznJufoqS23FtqVCzL0ZqgP5MqXbb4fg/WgDys70nA=

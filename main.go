@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/whyrusleeping/go-did"
+	"golang.org/x/crypto/acme/autocert"
 
 	cli "github.com/urfave/cli/v2"
 
@@ -140,6 +142,12 @@ var runCmd = &cli.Command{
 		&cli.StringFlag{
 			Name: "did-doc",
 		},
+		&cli.StringFlag{
+			Name: "auto-tls-domain",
+		},
+		&cli.BoolFlag{
+			Name: "no-index",
+		},
 	},
 	Action: func(cctx *cli.Context) error {
 
@@ -160,6 +168,7 @@ var runCmd = &cli.Command{
 
 		log.Infof("Configuring HTTP server")
 		e := echo.New()
+		e.Use(middleware.Logger())
 		e.HTTPErrorHandler = func(err error, c echo.Context) {
 			log.Error(err)
 		}
@@ -227,11 +236,30 @@ var runCmd = &cli.Command{
 		e.Use(middleware.CORS())
 		e.GET("/xrpc/app.bsky.feed.getFeedSkeleton", s.handleGetFeedSkeleton)
 		e.GET("/xrpc/app.bsky.feed.describeFeedGenerator", s.handleDescribeFeedGenerator)
-		e.GET(".well-known/did.json", s.handleServeDidDoc)
+		e.GET("/.well-known/did.json", s.handleServeDidDoc)
 
+		atd := cctx.String("auto-tls-domain")
+		if atd != "" {
+			cachedir, err := os.UserCacheDir()
+			if err != nil {
+				return err
+			}
+
+			e.AutoTLSManager.HostPolicy = autocert.HostWhitelist(atd)
+			// Cache certificates to avoid issues with rate limits (https://letsencrypt.org/docs/rate-limits)
+			e.AutoTLSManager.Cache = autocert.DirCache(filepath.Join(cachedir, "certs"))
+		}
 		go func() {
-			panic(e.Start(":3999"))
+			if atd != "" {
+				panic(e.StartAutoTLS(":3339"))
+			} else {
+				panic(e.Start(":3339"))
+			}
 		}()
+
+		if cctx.Bool("no-index") {
+			select {}
+		}
 
 		ctx := context.TODO()
 		if err := s.Run(ctx); err != nil {
@@ -262,6 +290,7 @@ type FeedItem struct {
 }
 
 func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
+
 	ctx := e.Request().Context()
 	feed := e.QueryParam("feed")
 
@@ -277,14 +306,18 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 			return err
 		}
 
-		return e.JSON(200, feed)
+		return e.JSON(200, &bsky.FeedGetFeedSkeleton_Output{
+			Feed: feed,
+		})
 	case "mostpop":
 		feed, err := s.getMostPop(ctx)
 		if err != nil {
 			return err
 		}
 
-		return e.JSON(200, feed)
+		return e.JSON(200, &bsky.FeedGetFeedSkeleton_Output{
+			Feed: feed,
+		})
 	default:
 		return &echo.HTTPError{
 			Code:    400,
@@ -294,56 +327,93 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 
 }
 
-func (s *Server) getMostPop(ctx context.Context) ([]FeedItem, error) {
+func (s *Server) getMostPop(ctx context.Context) ([]*bsky.FeedDefs_SkeletonFeedPost, error) {
 	// Get current time
-	now := time.Now()
+	now := time.Now().Truncate(time.Minute * 10)
 
 	// Get the time 6 hours ago
-	sixHoursAgo := now.Add(-6 * time.Hour)
+	sixHoursAgo := now.Add(-24 * time.Hour)
 
-	// Convert to SQLite-compatible datetime strings
-	nowStr := now.Format("2006-01-02 15:04:05")
-	sixHoursAgoStr := sixHoursAgo.Format("2006-01-02 15:04:05")
+	// Convert to PostgreSQL-compatible datetime strings
+	nowStr := now.UTC().Format("2006-01-02 15:04:05")
+	sixHoursAgoStr := sixHoursAgo.UTC().Format("2006-01-02 15:04:05")
 
 	// Raw SQL query
 	query := `
-		SELECT *
-		FROM post_refs
-		WHERE id IN (
-			SELECT id
-			FROM (
-				SELECT id, MAX(likes), strftime('%H:%M', created_at) AS interval
-				FROM post_refs
-				WHERE created_at BETWEEN ? AND ?
-				GROUP BY interval
-			)
-		)
+		SELECT id, likes, interval
+		FROM (
+			SELECT id, likes, 
+				date_trunc('10 minutes', created_at) AS interval,
+				RANK() OVER (
+					PARTITION BY date_trunc('10 minutes', created_at) 
+					ORDER BY likes DESC
+				) as rank
+			FROM post_refs
+			WHERE created_at BETWEEN $1 AND $2
+		) t
+		WHERE rank = 1;
 	`
+
+	query = `
+		SELECT *
+		FROM (
+			SELECT *
+				TIMESTAMP WITH TIME ZONE 'epoch' +
+				FLOOR((EXTRACT('epoch' FROM created_at) / 600)) * 600
+				* INTERVAL '1 second' AS interval,
+				RANK() OVER (
+					PARTITION BY TIMESTAMP WITH TIME ZONE 'epoch' +
+					FLOOR((EXTRACT('epoch' FROM created_at) / 600)) * 600
+					* INTERVAL '1 second'
+					ORDER BY likes DESC
+				) as rank
+			FROM post_refs
+			WHERE created_at BETWEEN $1 AND $2
+		) t
+		WHERE rank = 1;
+	`
+
+	query = `
+	SELECT *
+	FROM (
+		SELECT *,
+			RANK() OVER (
+				PARTITION BY TIMESTAMP WITH TIME ZONE 'epoch' +
+				FLOOR((EXTRACT('epoch' FROM created_at) / 600)) * 600
+				* INTERVAL '1 second'
+				ORDER BY likes DESC
+			) as rank
+		FROM post_refs
+		WHERE created_at BETWEEN $1 AND $2
+	) t
+	WHERE rank = 1;
+`
 
 	// Execute query and scan the results into a PostRef slice
 	var posts []PostRef
-	if err := s.db.Raw(query, sixHoursAgoStr, nowStr).Scan(&posts).Error; err != nil {
+	if err := s.db.Debug().Raw(query, sixHoursAgoStr, nowStr).Scan(&posts).Error; err != nil {
 		return nil, err
 	}
 
 	return s.postsToFeed(ctx, posts)
 }
 
-func (s *Server) postsToFeed(ctx context.Context, posts []PostRef) ([]FeedItem, error) {
-	var out []FeedItem
+func (s *Server) postsToFeed(ctx context.Context, posts []PostRef) ([]*bsky.FeedDefs_SkeletonFeedPost, error) {
+	out := []*bsky.FeedDefs_SkeletonFeedPost{}
 	for _, p := range posts {
 		uri, err := s.uriForPost(ctx, &p)
 		if err != nil {
 			return nil, err
 		}
 
-		out = append(out, FeedItem{Post: uri})
+		out = append(out, &bsky.FeedDefs_SkeletonFeedPost{Post: uri})
 	}
 
 	return out, nil
 }
 
-func (s *Server) getCoolstuff(ctx context.Context) ([]FeedItem, error) {
+func (s *Server) getCoolstuff(ctx context.Context) ([]*bsky.FeedDefs_SkeletonFeedPost, error) {
+	log.Info("serving coolstuff")
 	f, err := s.getFeedRef(ctx, "coolstuff")
 	if err != nil {
 		return nil, err
@@ -453,7 +523,7 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, rke
 		}
 	}
 
-	if u.Blessed || true {
+	if u.Blessed {
 		if err := s.addPostToFeed(ctx, "coolstuff", pref); err != nil {
 			return err
 		}
