@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	logging "github.com/ipfs/go-log"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"github.com/whyrusleeping/go-did"
 
 	cli "github.com/urfave/cli/v2"
 
@@ -53,14 +56,14 @@ type FeedIncl struct {
 
 type FeedLike struct {
 	ID   uint   `gorm:"primarykey"`
-	User uint   `gorm:"index"`
+	Uid  uint   `gorm:"index"`
 	Rkey string `gorm:"index"`
 	Ref  uint
 }
 
 type FeedRepost struct {
 	ID   uint   `gorm:"primarykey"`
-	User uint   `gorm:"index"`
+	Uid  uint   `gorm:"index"`
 	Rkey string `gorm:"index"`
 	Ref  uint
 }
@@ -97,7 +100,16 @@ type Server struct {
 	bgsxrpc *xrpc.Client
 	plc     *api.PLCServer
 
+	feeds  []feedSpec
+	didDoc *did.Document
+
 	userCache *lru.Cache
+}
+
+type feedSpec struct {
+	Name        string
+	Uri         string
+	Description string
 }
 
 var runCmd = &cli.Command{
@@ -105,7 +117,7 @@ var runCmd = &cli.Command{
 	Flags: []cli.Flag{
 		&cli.StringFlag{
 			Name:    "database-url",
-			Value:   "sqlite://data/thecloud.db",
+			Value:   "sqlite://data/algoz.db",
 			EnvVars: []string{"DATABASE_URL"},
 		},
 		&cli.StringFlag{
@@ -125,8 +137,12 @@ var runCmd = &cli.Command{
 			Name:  "pds-host",
 			Value: "https://bsky.social",
 		},
+		&cli.StringFlag{
+			Name: "did-doc",
+		},
 	},
 	Action: func(cctx *cli.Context) error {
+
 		log.Info("Connecting to database")
 		db, err := cliutil.SetupDatabase(cctx.String("database-url"))
 		if err != nil {
@@ -139,6 +155,8 @@ var runCmd = &cli.Command{
 		db.AutoMigrate(&PostRef{})
 		db.AutoMigrate(&FeedIncl{})
 		db.AutoMigrate(&Feed{})
+		db.AutoMigrate(&FeedLike{})
+		db.AutoMigrate(&FeedRepost{})
 
 		log.Infof("Configuring HTTP server")
 		e := echo.New()
@@ -174,25 +192,42 @@ var runCmd = &cli.Command{
 			userCache: ucache,
 		}
 
-		// Create some initial feed definitions
-		if err := s.db.FirstOrCreate(&Feed{
-			Name:        "coolstuff",
-			Description: "posts by specific cool people, maybe",
-		}).Error; err != nil {
-			return err
+		if d := cctx.String("did-doc"); d != "" {
+			doc, err := loadDidDocument(d)
+			if err != nil {
+				return err
+			}
+
+			s.didDoc = doc
 		}
 
-		if err := s.db.FirstOrCreate(&Feed{
-			Name:        "mostpop",
-			Description: "most popular posts for every ten minutes",
-		}).Error; err != nil {
-			return err
+		// Create some initial feed definitions
+		feeds := []feedSpec{
+			{
+				Name:        "coolstuff",
+				Description: "posts by specific cool people, maybe",
+				Uri:         "at://catsanddogs",
+			},
+			{
+				Name:        "mostpop",
+				Description: "most popular posts for every ten minutes",
+				Uri:         "at://bearcatfriend",
+			},
+		}
+
+		for _, f := range feeds {
+			if err := s.db.FirstOrCreate(&Feed{
+				Name:        f.Name,
+				Description: f.Description,
+			}).Error; err != nil {
+				return err
+			}
 		}
 
 		e.Use(middleware.CORS())
 		e.GET("/xrpc/app.bsky.feed.getFeedSkeleton", s.handleGetFeedSkeleton)
 		e.GET("/xrpc/app.bsky.feed.describeFeedGenerator", s.handleDescribeFeedGenerator)
-		//e.GET(".well-known/did.json", s.handleServeDidDoc)
+		e.GET(".well-known/did.json", s.handleServeDidDoc)
 
 		go func() {
 			panic(e.Start(":3999"))
@@ -205,6 +240,21 @@ var runCmd = &cli.Command{
 
 		return nil
 	},
+}
+
+func loadDidDocument(fn string) (*did.Document, error) {
+	fi, err := os.Open(fn)
+	if err != nil {
+		return nil, err
+	}
+	defer fi.Close()
+
+	var doc did.Document
+	if err := json.NewDecoder(fi).Decode(&doc); err != nil {
+		return nil, err
+	}
+
+	return &doc, nil
 }
 
 type FeedItem struct {
@@ -317,21 +367,62 @@ func (s *Server) uriForPost(ctx context.Context, pr *PostRef) (string, error) {
 }
 
 func (s *Server) handleDescribeFeedGenerator(e echo.Context) error {
-	panic("NYI")
+	var out bsky.FeedDescribeFeedGenerator_Output
+	out.Did = s.didDoc.ID.String()
+	for _, s := range s.feeds {
+		out.Feeds = append(out.Feeds, &bsky.FeedDescribeFeedGenerator_Feed{s.Uri})
+	}
+
+	return e.JSON(200, out)
 }
 
-/* // TODO: simplify a lot of things (maybe) by also hosting our own did:web document
 func (s *Server) handleServeDidDoc(e echo.Context) error {
-	// TODO:
-	return nil
+	return e.JSON(200, s.didDoc)
 }
-*/
 
 func (s *Server) deletePost(ctx context.Context, u *User, path string) error {
 	log.Infof("deleting post: %s", path)
 
 	// TODO:
 	return nil
+}
+
+func (s *Server) deleteLike(ctx context.Context, u *User, path string) error {
+	parts := strings.Split(path, "/")
+
+	rkey := parts[len(parts)-1]
+
+	var lk FeedLike
+	if err := s.db.First(&lk, "uid = ? AND rkey = ?", u.ID, rkey).Error; err != nil {
+		return err
+	}
+
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&PostRef{}).Where("id = ?", lk.Ref).Update("likes", gorm.Expr("likes - 1")).Error; err != nil {
+			return err
+		}
+
+		return tx.Delete(&lk).Error
+	})
+}
+
+func (s *Server) deleteRepost(ctx context.Context, u *User, path string) error {
+	parts := strings.Split(path, "/")
+
+	rkey := parts[len(parts)-1]
+
+	var rp FeedRepost
+	if err := s.db.First(&rp, "uid = ? AND rkey = ?", u.ID, rkey).Error; err != nil {
+		return err
+	}
+
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&PostRef{}).Where("id = ?", rp.Ref).Update("reposts", gorm.Expr("reposts - 1")).Error; err != nil {
+			return err
+		}
+
+		return tx.Delete(&rp).Error
+	})
 }
 
 func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, rkey string, pcid cid.Cid) error {
@@ -446,9 +537,21 @@ func (s *Server) updateUserHandle(ctx context.Context, did string, handle string
 	return s.db.Model(&User{}).Where("id = ?", u.ID).Update("handle", handle).Error
 }
 
-func (s *Server) handleLike(ctx context.Context, u *User, rec *bsky.FeedLike) error {
+func (s *Server) handleLike(ctx context.Context, u *User, rec *bsky.FeedLike, path string) error {
+	parts := strings.Split(path, "/")
+
 	p, err := s.getPostByUri(ctx, rec.Subject.Uri)
 	if err != nil {
+		return err
+	}
+
+	// TODO: this isnt a scalable way to handle likes, but its the only way
+	// right now to ensure that deletes can be correctly processed
+	if err := s.db.Create(&FeedLike{
+		Uid:  u.ID,
+		Rkey: parts[len(parts)-1],
+		Ref:  p.ID,
+	}).Error; err != nil {
 		return err
 	}
 
@@ -487,9 +590,19 @@ func (s *Server) addPostToFeed(ctx context.Context, feed string, p *PostRef) err
 	return nil
 }
 
-func (s *Server) handleRepost(ctx context.Context, u *User, rec *bsky.FeedRepost) error {
+func (s *Server) handleRepost(ctx context.Context, u *User, rec *bsky.FeedRepost, path string) error {
+	parts := strings.Split(path, "/")
+
 	p, err := s.getPostByUri(ctx, rec.Subject.Uri)
 	if err != nil {
+		return err
+	}
+
+	if err := s.db.Create(&FeedRepost{
+		Uid:  u.ID,
+		Rkey: parts[len(parts)-1],
+		Ref:  p.ID,
+	}).Error; err != nil {
 		return err
 	}
 
