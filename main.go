@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	api "github.com/bluesky-social/indigo/api"
+	"github.com/bluesky-social/indigo/api/atproto"
 	bsky "github.com/bluesky-social/indigo/api/bsky"
 	cliutil "github.com/bluesky-social/indigo/cmd/gosky/util"
 	"github.com/bluesky-social/indigo/util"
@@ -77,6 +79,7 @@ type User struct {
 	LastCrawl string
 
 	Blessed bool
+	Blocked bool
 }
 
 type LastSeq struct {
@@ -106,6 +109,8 @@ type Server struct {
 	didDoc *did.Document
 
 	userCache *lru.Cache
+
+	classifier *ImageClassifier
 }
 
 type feedSpec struct {
@@ -148,6 +153,9 @@ var runCmd = &cli.Command{
 		&cli.BoolFlag{
 			Name: "no-index",
 		},
+		&cli.StringFlag{
+			Name: "img-class-host",
+		},
 	},
 	Action: func(cctx *cli.Context) error {
 
@@ -174,7 +182,11 @@ var runCmd = &cli.Command{
 		}
 
 		xc := &xrpc.Client{
-			Host: cctx.String("pds-host"),
+			Host:    cctx.String("pds-host"),
+			Headers: map[string]string{},
+		}
+		if rbt := os.Getenv("RATELIMIT_BYPASS_TOKEN"); rbt != "" {
+			xc.Headers["X-Ratelimit-Bypass"] = rbt
 		}
 
 		plc := &api.PLCServer{
@@ -199,6 +211,10 @@ var runCmd = &cli.Command{
 			bgsxrpc:   bgsxrpc,
 			plc:       plc,
 			userCache: ucache,
+			classifier: &ImageClassifier{
+				Host:       cctx.String("img-class-host"),
+				Categories: []string{"cat", "dog", "mammal", "boobs", "bird", "clothed person", "cloud", "sky", "flower", "sea creature", "bird", "text post"},
+			},
 		}
 
 		if d := cctx.String("did-doc"); d != "" {
@@ -210,26 +226,54 @@ var runCmd = &cli.Command{
 			s.didDoc = doc
 		}
 
+		mydid := "did:plc:vpkhqolt662uhesyj6nxm7ys"
+		middlebit := mydid + "/app.bsky.feed.generator/"
+
 		// Create some initial feed definitions
-		feeds := []feedSpec{
+		s.feeds = []feedSpec{
 			{
 				Name:        "coolstuff",
 				Description: "posts by specific cool people, maybe",
-				Uri:         "at://catsanddogs",
+				Uri:         "at://" + middlebit + "coolstuff",
 			},
 			{
 				Name:        "mostpop",
 				Description: "most popular posts for every ten minutes",
-				Uri:         "at://bearcatfriend",
+				Uri:         "at://" + middlebit + "mostpop",
+			},
+			{
+				Name:        "cats",
+				Description: "cat pictures",
+				Uri:         "at://" + middlebit + "cats",
+			},
+			{
+				Name:        "dogs",
+				Description: "dog pictures",
+				Uri:         "at://" + middlebit + "dogs",
+			},
+			{
+				Name:        "nsfw",
+				Description: "nsfw pics",
+				Uri:         "at://" + middlebit + "nsfw",
+			},
+			{
+				Name:        "seacreatures",
+				Description: "All your favorite sea creatures",
+				Uri:         "at://" + middlebit + "seacreatures",
+			},
+			{
+				Name:        "flowers",
+				Description: "pictures of the flowers (potentially nsfw)",
+				Uri:         "at://" + middlebit + "flowers",
 			},
 		}
 
-		for _, f := range feeds {
-			if err := s.db.FirstOrCreate(&Feed{
+		for _, f := range s.feeds {
+			if err := s.db.Create(&Feed{
 				Name:        f.Name,
 				Description: f.Description,
 			}).Error; err != nil {
-				return err
+				fmt.Println(err)
 			}
 		}
 
@@ -294,23 +338,36 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 	ctx := e.Request().Context()
 	feed := e.QueryParam("feed")
 
+	var limit int = 100
+	if lims := e.QueryParam("limit"); lims != "" {
+		v, err := strconv.Atoi(lims)
+		if err != nil {
+			return err
+		}
+		limit = v
+	}
+
+	// TODO: technically should be checking that the full URI matches
 	puri, err := util.ParseAtUri(feed)
 	if err != nil {
 		return err
 	}
 
 	switch puri.Rkey {
-	case "coolstuff":
-		feed, err := s.getCoolstuff(ctx)
+	case "coolstuff", "cats", "dogs", "nsfw", "seacreatures", "flowers":
+		// all of these feeds are fed by the same 'feed_incls' table
+		feed, cursor, err := s.getFeed(ctx, puri.Rkey, limit, nil)
 		if err != nil {
 			return err
 		}
 
 		return e.JSON(200, &bsky.FeedGetFeedSkeleton_Output{
-			Feed: feed,
+			Feed:   feed,
+			Cursor: cursor,
 		})
 	case "mostpop":
-		feed, err := s.getMostPop(ctx)
+		// mostpop is fed by a sql query over all the posts
+		feed, err := s.getMostPop(ctx, limit)
 		if err != nil {
 			return err
 		}
@@ -327,72 +384,51 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 
 }
 
-func (s *Server) getMostPop(ctx context.Context) ([]*bsky.FeedDefs_SkeletonFeedPost, error) {
+func (s *Server) getMostPop(ctx context.Context, limit int) ([]*bsky.FeedDefs_SkeletonFeedPost, error) {
 	// Get current time
-	now := time.Now().Truncate(time.Minute * 10)
+	now := time.Now().UTC().Truncate(time.Minute * 10)
 
 	// Get the time 6 hours ago
-	sixHoursAgo := now.Add(-24 * time.Hour)
-
-	// Convert to PostgreSQL-compatible datetime strings
-	nowStr := now.UTC().Format("2006-01-02 15:04:05")
-	sixHoursAgoStr := sixHoursAgo.UTC().Format("2006-01-02 15:04:05")
+	sixHoursAgo := now.Add(-12 * time.Hour)
 
 	// Raw SQL query
 	query := `
-		SELECT id, likes, interval
-		FROM (
-			SELECT id, likes, 
-				date_trunc('10 minutes', created_at) AS interval,
-				RANK() OVER (
-					PARTITION BY date_trunc('10 minutes', created_at) 
-					ORDER BY likes DESC
-				) as rank
-			FROM post_refs
-			WHERE created_at BETWEEN $1 AND $2
-		) t
-		WHERE rank = 1;
-	`
-
-	query = `
 		SELECT *
-		FROM (
-			SELECT *
-				TIMESTAMP WITH TIME ZONE 'epoch' +
-				FLOOR((EXTRACT('epoch' FROM created_at) / 600)) * 600
-				* INTERVAL '1 second' AS interval,
-				RANK() OVER (
-					PARTITION BY TIMESTAMP WITH TIME ZONE 'epoch' +
-					FLOOR((EXTRACT('epoch' FROM created_at) / 600)) * 600
-					* INTERVAL '1 second'
-					ORDER BY likes DESC
-				) as rank
-			FROM post_refs
-			WHERE created_at BETWEEN $1 AND $2
-		) t
-		WHERE rank = 1;
+		FROM post_refs
+		LEFT JOIN users on post_refs.uid = users.id
+		WHERE (users.blocked IS NULL OR users.blocked = false) AND post_refs.created_at BETWEEN $1 AND $2
+		ORDER BY likes DESC
+		LIMIT 1
 	`
 
-	query = `
-	SELECT *
-	FROM (
-		SELECT *,
-			RANK() OVER (
-				PARTITION BY TIMESTAMP WITH TIME ZONE 'epoch' +
-				FLOOR((EXTRACT('epoch' FROM created_at) / 600)) * 600
-				* INTERVAL '1 second'
-				ORDER BY likes DESC
-			) as rank
-		FROM post_refs
-		WHERE created_at BETWEEN $1 AND $2
-	) t
-	WHERE rank = 1;
-`
-
-	// Execute query and scan the results into a PostRef slice
+	// Initialize an empty slice to store the posts
 	var posts []PostRef
-	if err := s.db.Debug().Raw(query, sixHoursAgoStr, nowStr).Scan(&posts).Error; err != nil {
-		return nil, err
+
+	// Iterate over each 10-minute window in the past 6 hours
+	for t := now; t.After(sixHoursAgo); t = t.Add(-10 * time.Minute) {
+		// Define the start and end of the window
+		windowEnd := t
+		windowStart := t.Add(-10 * time.Minute)
+
+		// Convert to PostgreSQL-compatible datetime strings
+		windowStartStr := windowStart.Format("2006-01-02 15:04:05")
+		windowEndStr := windowEnd.Format("2006-01-02 15:04:05")
+
+		// Execute query and scan the results into a PostRef
+		var post PostRef
+		if err := s.db.Raw(query, windowStartStr, windowEndStr).Scan(&post).Error; err != nil {
+			// If an error occurred, return the error
+			return nil, err
+		}
+
+		if post.ID > 0 {
+			// Add the post to the slice of posts
+			posts = append(posts, post)
+		}
+
+		if len(posts) >= limit {
+			break
+		}
 	}
 
 	return s.postsToFeed(ctx, posts)
@@ -412,19 +448,28 @@ func (s *Server) postsToFeed(ctx context.Context, posts []PostRef) ([]*bsky.Feed
 	return out, nil
 }
 
-func (s *Server) getCoolstuff(ctx context.Context) ([]*bsky.FeedDefs_SkeletonFeedPost, error) {
-	log.Info("serving coolstuff")
-	f, err := s.getFeedRef(ctx, "coolstuff")
+func parseTimeCursor(c string) (time.Time, error) {
+	return time.Parse(time.RFC3339, c)
+}
+
+func (s *Server) getFeed(ctx context.Context, feed string, limit int, cursor *string) ([]*bsky.FeedDefs_SkeletonFeedPost, *string, error) {
+	log.Infof("serving %s", feed)
+	f, err := s.getFeedRef(ctx, feed)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var posts []PostRef
-	if err := s.db.Table("feed_incls").Where("feed_incls.feed = ?", f.ID).Joins("INNER JOIN post_refs on post_refs.id = feed_incls.post").Select("post_refs.*").Order("post_refs.created_at desc").Limit(50).Find(&posts).Error; err != nil {
-		return nil, err
+	if err := s.db.Table("feed_incls").Where("feed_incls.feed = ?", f.ID).Joins("INNER JOIN post_refs on post_refs.id = feed_incls.post").Select("post_refs.*").Order("post_refs.created_at desc").Limit(limit).Find(&posts).Error; err != nil {
+		return nil, nil, err
 	}
 
-	return s.postsToFeed(ctx, posts)
+	skelposts, err := s.postsToFeed(ctx, posts)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return skelposts, nil, nil
 }
 
 func (s *Server) uriForPost(ctx context.Context, pr *PostRef) (string, error) {
@@ -495,14 +540,23 @@ func (s *Server) deleteRepost(ctx context.Context, u *User, path string) error {
 	})
 }
 
-func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, rkey string, pcid cid.Cid) error {
-	log.Infof("indexing post: %s", rkey)
+func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, path string, pcid cid.Cid) error {
+	log.Infof("indexing post: %s", path)
+
+	t, err := time.Parse(util.ISO8601, rec.CreatedAt)
+	if err != nil {
+		log.Infof("post had invalid creation time: %s", err)
+	}
+
+	parts := strings.Split(path, "/")
+	rkey := parts[len(parts)-1]
 
 	pref := &PostRef{
-		Cid:      pcid.String(),
-		Rkey:     rkey,
-		Uid:      u.ID,
-		NotFound: false,
+		CreatedAt: t,
+		Cid:       pcid.String(),
+		Rkey:      rkey,
+		Uid:       u.ID,
+		NotFound:  false,
 	}
 
 	// Update columns to default value on `id` conflict
@@ -529,7 +583,48 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, rke
 		}
 	}
 
+	if rec.Embed != nil && rec.Embed.EmbedImages != nil {
+		for _, img := range rec.Embed.EmbedImages.Images {
+			class, err := s.fetchAndClassifyImage(ctx, u.Did, img)
+			if err != nil {
+				return fmt.Errorf("classification failed: %w", err)
+			}
+
+			switch class {
+			case "cat":
+				if err := s.addPostToFeed(ctx, "cats", pref); err != nil {
+					return err
+				}
+			case "dog":
+				if err := s.addPostToFeed(ctx, "dogs", pref); err != nil {
+					return err
+				}
+			case "boobs":
+				if err := s.addPostToFeed(ctx, "nsfw", pref); err != nil {
+					return err
+				}
+			case "sea creature":
+				if err := s.addPostToFeed(ctx, "sea creatures", pref); err != nil {
+					return err
+				}
+			case "flower":
+				if err := s.addPostToFeed(ctx, "flowers", pref); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
 	return nil
+}
+
+func (s *Server) fetchAndClassifyImage(ctx context.Context, did string, img *bsky.EmbedImages_Image) (string, error) {
+	blob, err := atproto.SyncGetBlob(ctx, s.xrpcc, img.Image.Ref.String(), did)
+	if err != nil {
+		return "", err
+	}
+
+	return s.classifier.Classify(ctx, blob)
 }
 
 func (s *Server) incrementReplyTo(ctx context.Context, uri string) error {

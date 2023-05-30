@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	api "github.com/bluesky-social/indigo/api"
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
@@ -41,13 +42,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("get last cursor: %w", err)
 	}
 
-	d := websocket.DefaultDialer
-	con, _, err := d.Dial(fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos?cursor=%d", s.bgshost, cur), http.Header{})
-	if err != nil {
-		return fmt.Errorf("events dial failed: %w", err)
-	}
-
-	pool := events.NewConsumerPool(8, 32, func(ctx context.Context, xe *events.XRPCStreamEvent) error {
+	pool := events.NewConsumerPool(16, 32, func(ctx context.Context, xe *events.XRPCStreamEvent) error {
 		switch {
 		case xe.RepoCommit != nil:
 			evt := xe.RepoCommit
@@ -111,11 +106,29 @@ func (s *Server) Run(ctx context.Context) error {
 			return nil
 		}
 	})
-	if err != nil {
-		return err
-	}
 
-	return events.HandleRepoStream(ctx, con, pool)
+	var backoff time.Duration
+	for {
+		d := websocket.DefaultDialer
+		con, _, err := d.Dial(fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos?cursor=%d", s.bgshost, cur), http.Header{})
+		if err != nil {
+			log.Errorf("failed to dial: %s", err)
+			time.Sleep(backoff)
+
+			backoff = (backoff * 2) + time.Second
+			if backoff > time.Minute*2 {
+				return fmt.Errorf("failed to dial for a long time")
+			}
+			continue
+		}
+
+		backoff = 0
+
+		if err := events.HandleRepoStream(ctx, con, pool); err != nil {
+			log.Errorf("stream processing error: %s", err)
+
+		}
+	}
 }
 
 // handleOp receives every incoming repo event and is where indexing logic lives
