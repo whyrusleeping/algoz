@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	api "github.com/bluesky-social/indigo/api"
@@ -102,15 +103,31 @@ type Follow struct {
 	Rkey      string `gorm:"index"`
 }
 
+type Block struct {
+	ID      uint   `gorm:"primarykey"`
+	Uid     uint   `gorm:"index"`
+	Blocked uint   `gorm:"index"`
+	Rkey    string `gorm:"index"`
+}
+
 type User struct {
 	gorm.Model
-	Did       string `gorm:"index"`
-	Handle    string
-	LastCrawl string
+	Did    string `gorm:"index"`
+	Handle string
+
+	LatestPost uint
 
 	Blessed        bool
 	Blocked        bool
 	ScrapedFollows bool
+
+	lk sync.Mutex
+}
+
+func (u *User) hasFollowsScraped() bool {
+	u.lk.Lock()
+	defer u.lk.Unlock()
+	return u.ScrapedFollows
 }
 
 type LastSeq struct {
@@ -139,6 +156,7 @@ type Server struct {
 	feeds  []feedSpec
 	didDoc *did.Document
 
+	userLk    sync.Mutex
 	userCache *lru.Cache
 	keyCache  *lru.Cache
 
@@ -363,6 +381,12 @@ var runCmd = &cli.Command{
 	},
 }
 
+type FeedBuilder interface {
+	Name() string
+	Description() string
+	HandlePost(context.Context, *User, *bsky.FeedPost) error
+}
+
 func loadDidDocument(fn string) (*did.Document, error) {
 	fi, err := os.Open(fn)
 	if err != nil {
@@ -531,7 +555,7 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 				Message: "auth required for feed",
 			}
 		}
-		feed, outcurs, err := s.getBestOfFollows(ctx, authedUser, limit, cursor)
+		feed, outcurs, err := s.getMostRecentFromFollows(ctx, authedUser, limit, cursor)
 		if err != nil {
 			return err
 		}
@@ -546,11 +570,9 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 			Message: "no such feed",
 		}
 	}
-
 }
 
 func (s *Server) getWhatsLit(ctx context.Context, limit int, cursor *string) ([]*bsky.FeedDefs_SkeletonFeedPost, *string, error) {
-	// select count(*) from feed_likes left join post_refs on feed_likes.ref = post_refs.id where feed_likes.uid = 3 and post_refs.uid = 11;
 	panic("no")
 }
 
@@ -653,12 +675,48 @@ func (s *Server) scrapeFollowsForUser(ctx context.Context, u *User) error {
 		cursor = *resp.Cursor
 	}
 
+	if err := s.db.Table("users").Where("id = ?", u.ID).Update("scraped_follows", true).Error; err != nil {
+		return err
+	}
+	u.lk.Lock()
 	u.ScrapedFollows = true
-	return s.db.Table("users").Where("id = ?", u.ID).Update("scraped_follows", true).Error
+	u.lk.Unlock()
+
+	return nil
 }
 
-func (s *Server) getBestOfFollows(ctx context.Context, u *User, limit int, cursor *string) ([]*bsky.FeedDefs_SkeletonFeedPost, *string, error) {
-	if !u.ScrapedFollows {
+func (s *Server) latestPostForUser(ctx context.Context, uid uint) (*PostRef, error) {
+	var u User
+	if err := s.db.First(&u, "id = ?", uid).Error; err != nil {
+		return nil, err
+	}
+
+	u.lk.Lock()
+	lp := u.LatestPost
+	u.lk.Unlock()
+
+	if lp == 0 {
+		var p PostRef
+		if err := s.db.Find(&p, "uid = ? AND NOT is_reply").Order("created_at DESC").Limit(1).Error; err != nil {
+			return nil, err
+		}
+
+		if err := s.setUserLastPost(&u, &p); err != nil {
+			return nil, err
+		}
+
+		return &p, nil
+	} else {
+		var p PostRef
+		if err := s.db.First(&p, "id = ?", p.ID).Error; err != nil {
+			return nil, err
+		}
+		return &p, nil
+	}
+}
+
+func (s *Server) getMostRecentFromFollows(ctx context.Context, u *User, limit int, cursor *string) ([]*bsky.FeedDefs_SkeletonFeedPost, *string, error) {
+	if !u.hasFollowsScraped() {
 		if err := s.scrapeFollowsForUser(ctx, u); err != nil {
 			return nil, nil, err
 		}
@@ -688,51 +746,22 @@ func (s *Server) getBestOfFollows(ctx context.Context, u *User, limit int, curso
 		start = num
 	}
 
-	query := `WITH limited_follows AS (
-    SELECT following
-    FROM follows
-    WHERE uid = ? ORDER BY follows.id DESC LIMIT ? OFFSET ?
-),
-latest_posts AS (
-    SELECT 
-        post_refs.*,
-        ROW_NUMBER() OVER (
-            PARTITION BY post_refs.uid 
-            ORDER BY post_refs.created_at DESC
-        ) as rn
-    FROM post_refs
-    INNER JOIN limited_follows ON post_refs.uid = limited_follows.following
-	WHERE NOT post_refs.is_reply
-)
-SELECT * FROM latest_posts WHERE rn = 1;`
-	query = `WITH followed_users AS (
-  SELECT following
-  FROM follows
-  WHERE uid = ?
-  ORDER BY id DESC
-  LIMIT ? OFFSET ?
-),
-numbered_posts AS (
-  SELECT *,
-    ROW_NUMBER() OVER (PARTITION BY uid ORDER BY created_at DESC) AS rn
-  FROM post_refs
-  WHERE uid IN (SELECT following FROM followed_users) AND not is_reply
-)
-SELECT *
-FROM numbered_posts
-WHERE rn = 1;`
-
-	// Execute query and scan the results into a PostRef slice
-	var posts []PostRef
-	if err := s.db.Raw(query, u.ID, limit, start).Scan(&posts).Error; err != nil {
+	var follows []Follow
+	if err := s.db.Limit(limit).Offset(start).Order("id DESC").Find(&follows, "uid = ?", u.ID).Error; err != nil {
 		return nil, nil, err
 	}
 
-	if len(posts) > limit {
-		posts = posts[:limit]
+	var out []PostRef
+	for _, f := range follows {
+		pref, err := s.latestPostForUser(ctx, f.Following)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		out = append(out, *pref)
 	}
 
-	fp, err := s.postsToFeed(ctx, posts)
+	fp, err := s.postsToFeed(ctx, out)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -955,6 +984,11 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 		if err := s.incrementReplyRoot(ctx, rec.Reply.Root.Uri); err != nil {
 			return err
 		}
+	} else {
+		// track latest post from each user
+		if err := s.setUserLastPost(u, pref); err != nil {
+			return err
+		}
 	}
 
 	if u.Blessed {
@@ -1000,6 +1034,16 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 		}
 	}
 
+	return nil
+}
+
+func (s *Server) setUserLastPost(u *User, p *PostRef) error {
+	u.lk.Lock()
+	if err := s.db.Table("users").Where("id = ?", u.ID).Update("latest_post", p.ID).Error; err != nil {
+		return err
+	}
+	u.LatestPost = p.ID
+	u.lk.Unlock()
 	return nil
 }
 
@@ -1223,6 +1267,25 @@ func (s *Server) handleFollow(ctx context.Context, u *User, rec *bsky.GraphFollo
 		Uid:       u.ID,
 		Rkey:      parts[len(parts)-1],
 		Following: target.ID,
+	}).Error; err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Server) handleBlock(ctx context.Context, u *User, rec *bsky.GraphBlock, path string) error {
+	parts := strings.Split(path, "/")
+
+	target, err := s.getOrCreateUser(ctx, rec.Subject)
+	if err != nil {
+		return err
+	}
+
+	if err := s.db.Create(&Block{
+		Uid:     u.ID,
+		Rkey:    parts[len(parts)-1],
+		Blocked: target.ID,
 	}).Error; err != nil {
 		return err
 	}

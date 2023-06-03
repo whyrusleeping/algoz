@@ -160,6 +160,10 @@ func (s *Server) handleOp(ctx context.Context, op repomgr.EventKind, seq int64, 
 			if err := s.handleFollow(ctx, u, rec, path); err != nil {
 				return fmt.Errorf("handling repost: %w", err)
 			}
+		case *bsky.GraphBlock:
+			if err := s.handleBlock(ctx, u, rec, path); err != nil {
+				return fmt.Errorf("handling repost: %w", err)
+			}
 		default:
 		}
 
@@ -229,12 +233,26 @@ func (s *Server) processTooBigCommit(ctx context.Context, evt *comatproto.SyncSu
 }
 
 func (s *Server) getOrCreateUser(ctx context.Context, did string) (*User, error) {
+	s.userLk.Lock()
 	cu, ok := s.userCache.Get(did)
 	if ok {
+		s.userLk.Unlock()
+		u := cu.(*User)
+		u.lk.Lock()
+		u.lk.Unlock()
+		if u.ID == 0 {
+			return nil, fmt.Errorf("user creation failed")
+		}
+
 		return cu.(*User), nil
 	}
 
 	var u User
+	s.userCache.Add(did, &u)
+
+	u.lk.Lock()
+	s.userLk.Unlock()
+
 	if err := s.db.Find(&u, "did = ?", did).Error; err != nil {
 		return nil, err
 	}
@@ -249,11 +267,11 @@ func (s *Server) getOrCreateUser(ctx context.Context, did string) (*User, error)
 
 		u.Did = did
 		if err := s.db.Create(&u).Error; err != nil {
+			s.userCache.Remove(did)
+
 			return nil, err
 		}
 	}
-
-	s.userCache.Add(did, &u)
 
 	return &u, nil
 }
