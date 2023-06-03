@@ -134,7 +134,7 @@ func (s *Server) Run(ctx context.Context) error {
 // handleOp receives every incoming repo event and is where indexing logic lives
 func (s *Server) handleOp(ctx context.Context, op repomgr.EventKind, seq int64, path string, did string, rcid *cid.Cid, rec any) error {
 	if op == repomgr.EvtKindCreateRecord || op == repomgr.EvtKindUpdateRecord {
-		log.Infof("handling event(%d): %s - %s", seq, did, path)
+		log.Debugf("handling event(%d): %s - %s", seq, did, path)
 		u, err := s.getOrCreateUser(ctx, did)
 		if err != nil {
 			return fmt.Errorf("checking user: %w", err)
@@ -154,6 +154,10 @@ func (s *Server) handleOp(ctx context.Context, op repomgr.EventKind, seq int64, 
 			}
 		case *bsky.FeedRepost:
 			if err := s.handleRepost(ctx, u, rec, path); err != nil {
+				return fmt.Errorf("handling repost: %w", err)
+			}
+		case *bsky.GraphFollow:
+			if err := s.handleFollow(ctx, u, rec, path); err != nil {
 				return fmt.Errorf("handling repost: %w", err)
 			}
 		default:
@@ -179,6 +183,10 @@ func (s *Server) handleOp(ctx context.Context, op repomgr.EventKind, seq int64, 
 			}
 		case "app.bsky.feed.repost":
 			if err := s.deleteRepost(ctx, u, path); err != nil {
+				return err
+			}
+		case "app.bsky.graph.follow":
+			if err := s.deleteFollow(ctx, u, path); err != nil {
 				return err
 			}
 		}
@@ -210,27 +218,13 @@ func (s *Server) processTooBigCommit(ctx context.Context, evt *comatproto.SyncSu
 	}
 
 	return r.ForEach(ctx, "", func(k string, v cid.Cid) error {
-		if strings.HasPrefix(k, "app.bsky.feed.post") || strings.HasPrefix(k, "app.bsky.actor.profile") {
-			rcid, rec, err := r.GetRecord(ctx, k)
-			if err != nil {
-				log.Errorf("failed to get record from repo checkout: %s", err)
-				return nil
-			}
-
-			switch rec := rec.(type) {
-			case *bsky.FeedPost:
-				if err := s.indexPost(ctx, u, rec, k, rcid); err != nil {
-					return fmt.Errorf("indexing post: %w", err)
-				}
-			case *bsky.ActorProfile:
-				if err := s.indexProfile(ctx, u, rec); err != nil {
-					return fmt.Errorf("indexing profile: %w", err)
-				}
-			default:
-			}
-
+		rcid, rec, err := r.GetRecord(ctx, k)
+		if err != nil {
+			log.Errorf("failed to get record from repo checkout: %s", err)
+			return nil
 		}
-		return nil
+
+		return s.handleOp(ctx, repomgr.EvtKindCreateRecord, evt.Seq, k, u.Did, &rcid, rec)
 	})
 }
 
@@ -265,7 +259,7 @@ func (s *Server) getOrCreateUser(ctx context.Context, did string) (*User, error)
 }
 
 func (s *Server) handleFromDid(ctx context.Context, did string) (string, error) {
-	handle, _, err := api.ResolveDidToHandle(ctx, s.xrpcc, s.plc, did)
+	handle, _, err := api.ResolveDidToHandle(ctx, s.xrpcc, s.didr, did)
 	if err != nil {
 		return "", err
 	}
