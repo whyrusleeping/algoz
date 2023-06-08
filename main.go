@@ -229,6 +229,7 @@ var runCmd = &cli.Command{
 		db.AutoMigrate(&Feed{})
 		db.AutoMigrate(&FeedLike{})
 		db.AutoMigrate(&FeedRepost{})
+		db.AutoMigrate(&Block{})
 
 		log.Infof("Configuring HTTP server")
 		e := echo.New()
@@ -718,14 +719,16 @@ func (s *Server) latestPostForUser(ctx context.Context, uid uint) (*PostRef, err
 		return nil, err
 	}
 
-	u.lk.Lock()
 	lp := u.LatestPost
-	u.lk.Unlock()
 
 	if lp == 0 {
 		var p PostRef
-		if err := s.db.Find(&p, "uid = ? AND NOT is_reply").Order("created_at DESC").Limit(1).Error; err != nil {
+		if err := s.db.Order("created_at DESC").Limit(1).Find(&p, "uid = ? AND NOT is_reply", uid).Error; err != nil {
 			return nil, err
+		}
+
+		if p.ID == 0 {
+			return nil, nil
 		}
 
 		if err := s.setUserLastPost(&u, &p); err != nil {
@@ -735,9 +738,14 @@ func (s *Server) latestPostForUser(ctx context.Context, uid uint) (*PostRef, err
 		return &p, nil
 	} else {
 		var p PostRef
-		if err := s.db.First(&p, "id = ?", p.ID).Error; err != nil {
+		if err := s.db.Find(&p, "id = ?", lp).Error; err != nil {
 			return nil, err
 		}
+
+		if p.ID == 0 {
+			return nil, nil
+		}
+
 		return &p, nil
 	}
 }
@@ -773,19 +781,30 @@ func (s *Server) getMostRecentFromFollows(ctx context.Context, u *User, limit in
 		start = num
 	}
 
-	var follows []Follow
-	if err := s.db.Limit(limit).Offset(start).Order("id DESC").Find(&follows, "uid = ?", u.ID).Error; err != nil {
+	var fusers []User
+	if err := s.db.Table("follows").Joins("LEFT JOIN users on follows.following = users.id").Where("follows.uid = ?", u.ID).Limit(limit).Offset(start).Order("follows.id ASC").Scan(&fusers).Error; err != nil {
 		return nil, nil, err
 	}
 
-	var out []PostRef
-	for _, f := range follows {
-		pref, err := s.latestPostForUser(ctx, f.Following)
-		if err != nil {
-			return nil, nil, err
+	for _, f := range fusers {
+		if f.LatestPost == 0 {
+			_, err := s.latestPostForUser(ctx, f.ID)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
+	}
 
-		out = append(out, *pref)
+	var out []PostRef
+	if err := s.db.Table("follows").
+		Joins("LEFT JOIN users on follows.following = users.id").
+		Joins("INNER JOIN post_refs on users.latest_post = post_refs.id").
+		Where("follows.uid = ?", u.ID).
+		Limit(limit).
+		Offset(start).
+		Order("follows.id ASC").
+		Scan(&out).Error; err != nil {
+		return nil, nil, err
 	}
 
 	fp, err := s.postsToFeed(ctx, out)

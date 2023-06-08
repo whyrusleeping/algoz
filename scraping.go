@@ -251,6 +251,7 @@ func (s *Server) getOrCreateUser(ctx context.Context, did string) (*User, error)
 	s.userCache.Add(did, &u)
 
 	u.lk.Lock()
+	defer u.lk.Unlock()
 	s.userLk.Unlock()
 
 	if err := s.db.Find(&u, "did = ?", did).Error; err != nil {
