@@ -38,21 +38,22 @@ var EpochOne time.Time = time.Unix(1, 1)
 
 var log = logging.Logger("algoz")
 
-/*
-type PostRef struct {
-	ID        uint      `gorm:"primarykey"`
-	CreatedAt time.Time `gorm:"index"`
-
-	Cid        string
-	Rkey       string `gorm:"uniqueIndex:idx_post_rkeyuid"`
-	Uid        uint   `gorm:"uniqueIndex:idx_post_rkeyuid"`
-	NotFound   bool
-	Likes      int
-	Reposts    int
-	Replies    int
-	ThreadSize int
+type FeedBuilder interface {
+	Name() string
+	Description() string
+	GetFeed(context.Context, *User, int, *string) (*bsky.FeedGetFeedSkeleton_Output, error)
+	Processor
 }
-*/
+
+type Labeler interface {
+	Processor
+}
+
+type Processor interface {
+	HandlePost(context.Context, *User, *PostRef, *bsky.FeedPost) error
+	HandleLike(context.Context, *User, *bsky.FeedPost) error
+	HandleRepost(context.Context, *User, *bsky.FeedPost) error
+}
 
 type PostRef struct {
 	ID        uint      `gorm:"primarykey"`
@@ -66,8 +67,11 @@ type PostRef struct {
 	Reposts    int
 	Replies    int
 	ThreadSize int
+	ThreadRoot uint
 	ReplyTo    uint `gorm:"index"`
 	IsReply    bool `gorm:"index"`
+	HasImage   bool
+	Reposting  uint
 }
 
 type Feed struct {
@@ -153,14 +157,15 @@ type Server struct {
 	bgsxrpc *xrpc.Client
 	didr    did.Resolver
 
+	processors []Processor
+	fbm        map[string]FeedBuilder
+
 	feeds  []feedSpec
 	didDoc *did.Document
 
 	userLk    sync.Mutex
 	userCache *lru.Cache
 	keyCache  *lru.Cache
-
-	classifier *ImageClassifier
 }
 
 type feedSpec struct {
@@ -268,10 +273,7 @@ var runCmd = &cli.Command{
 			didr:      didr,
 			userCache: ucache,
 			keyCache:  kcache,
-			classifier: &ImageClassifier{
-				Host:       cctx.String("img-class-host"),
-				Categories: []string{"cat", "dog", "mammal", "bird", "clothed person", "cloud", "sky", "flower", "sea creature", "bird", "text post"},
-			},
+			fbm:       make(map[string]FeedBuilder),
 		}
 
 		if d := cctx.String("did-doc"); d != "" {
@@ -285,6 +287,15 @@ var runCmd = &cli.Command{
 
 		mydid := "did:plc:vpkhqolt662uhesyj6nxm7ys"
 		middlebit := mydid + "/app.bsky.feed.generator/"
+
+		allpicsuri := "at://" + middlebit + "allpics"
+		s.AddFeedBuilder(allpicsuri, &AllPicsFeed{
+			name: "allpics",
+			desc: "Every picture posted on the app",
+			s:    s,
+		})
+
+		s.AddProcessor(NewImageLabeler(cctx.String("img-class-host"), s.db, s.xrpcc, s.addPostToFeed))
 
 		// Create some initial feed definitions
 		s.feeds = []feedSpec{
@@ -381,12 +392,6 @@ var runCmd = &cli.Command{
 	},
 }
 
-type FeedBuilder interface {
-	Name() string
-	Description() string
-	HandlePost(context.Context, *User, *bsky.FeedPost) error
-}
-
 func loadDidDocument(fn string) (*did.Document, error) {
 	fi, err := os.Open(fn)
 	if err != nil {
@@ -400,6 +405,15 @@ func loadDidDocument(fn string) (*did.Document, error) {
 	}
 
 	return &doc, nil
+}
+
+func (s *Server) AddProcessor(p Processor) {
+	s.processors = append(s.processors, p)
+}
+
+func (s *Server) AddFeedBuilder(uri string, fb FeedBuilder) {
+	s.AddProcessor(fb)
+	s.fbm[uri] = fb
 }
 
 type cachedKey struct {
@@ -515,8 +529,21 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 		cursor = &c
 	}
 
+	fb, ok := s.fbm[feed]
+	if ok {
+		out, err := fb.GetFeed(ctx, authedUser, limit, cursor)
+		if err != nil {
+			return &echo.HTTPError{
+				Code:    500,
+				Message: fmt.Sprintf("getFeed failed: %s", err),
+			}
+		}
+
+		return e.JSON(200, out)
+	}
+
 	switch puri.Rkey {
-	case "coolstuff", "cats", "dogs", "nsfw", "seacreatures", "flowers", "allpics":
+	case "coolstuff", "cats", "dogs", "nsfw", "seacreatures", "flowers":
 		// all of these feeds are fed by the same 'feed_incls' table
 		feed, outcurs, err := s.getFeed(ctx, puri.Rkey, limit, cursor)
 		if err != nil {
@@ -966,6 +993,35 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 		}
 		pref.ReplyTo = repto.ID
 		pref.IsReply = true
+
+		reproot, err := s.getPostByUri(ctx, rec.Reply.Root.Uri)
+		if err != nil {
+			return err
+		}
+
+		pref.ThreadRoot = reproot.ID
+	}
+
+	if rec.Embed != nil {
+		if rec.Embed.EmbedImages != nil && len(rec.Embed.EmbedImages.Images) > 0 {
+			pref.HasImage = true
+		}
+
+		var rpref string
+		if rec.Embed.EmbedRecord != nil {
+			rpref = rec.Embed.EmbedRecord.Record.Uri
+		}
+		if rec.Embed.EmbedRecordWithMedia != nil {
+			rpref = rec.Embed.EmbedRecordWithMedia.Record.Record.Uri
+		}
+		if rpref != "" && strings.Contains(rec.Embed.EmbedRecord.Record.Uri, "app.bsky.feed.post") {
+			rp, err := s.getPostByUri(ctx, rpref)
+			if err != nil {
+				return err
+			}
+
+			pref.Reposting = rp.ID
+		}
 	}
 
 	// Update columns to default value on `id` conflict
@@ -991,6 +1047,12 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 		}
 	}
 
+	for _, fb := range s.processors {
+		if err := fb.HandlePost(ctx, u, pref, rec); err != nil {
+			return err
+		}
+	}
+
 	if u.Blessed {
 		if err := s.addPostToFeed(ctx, "coolstuff", pref); err != nil {
 			return err
@@ -1002,37 +1064,6 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 			return err
 		}
 	*/
-	if rec.Embed != nil && rec.Embed.EmbedImages != nil {
-		if err := s.addPostToFeed(ctx, "allpics", pref); err != nil {
-			return err
-		}
-
-		for _, img := range rec.Embed.EmbedImages.Images {
-			class, err := s.fetchAndClassifyImage(ctx, u.Did, img)
-			if err != nil {
-				return fmt.Errorf("classification failed: %w", err)
-			}
-
-			switch class {
-			case "cat":
-				if err := s.addPostToFeed(ctx, "cats", pref); err != nil {
-					return err
-				}
-			case "dog":
-				if err := s.addPostToFeed(ctx, "dogs", pref); err != nil {
-					return err
-				}
-			case "sea creature":
-				if err := s.addPostToFeed(ctx, "seacreatures", pref); err != nil {
-					return err
-				}
-			case "flower":
-				if err := s.addPostToFeed(ctx, "flowers", pref); err != nil {
-					return err
-				}
-			}
-		}
-	}
 
 	return nil
 }
@@ -1045,15 +1076,6 @@ func (s *Server) setUserLastPost(u *User, p *PostRef) error {
 	u.LatestPost = p.ID
 	u.lk.Unlock()
 	return nil
-}
-
-func (s *Server) fetchAndClassifyImage(ctx context.Context, did string, img *bsky.EmbedImages_Image) (string, error) {
-	blob, err := atproto.SyncGetBlob(ctx, s.xrpcc, img.Image.Ref.String(), did)
-	if err != nil {
-		return "", err
-	}
-
-	return s.classifier.Classify(ctx, blob)
 }
 
 func (s *Server) incrementReplyTo(ctx context.Context, uri string) error {
