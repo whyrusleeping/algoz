@@ -26,6 +26,10 @@ import (
 	logging "github.com/ipfs/go-log"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"github.com/whyrusleeping/algoz/models"
+	. "github.com/whyrusleeping/algoz/models"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/crypto/acme/autocert"
 
 	cli "github.com/urfave/cli/v2"
@@ -33,6 +37,12 @@ import (
 	gorm "gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+//type User = models.User
+//type PostRef = models.PostRef
+//type FeedLike = models.FeedLike
+//type FeedRepost = models.FeedRepost
+//type Feed = models.Feed
 
 var EpochOne time.Time = time.Unix(1, 1)
 
@@ -53,85 +63,6 @@ type Processor interface {
 	HandlePost(context.Context, *User, *PostRef, *bsky.FeedPost) error
 	HandleLike(context.Context, *User, *bsky.FeedPost) error
 	HandleRepost(context.Context, *User, *bsky.FeedPost) error
-}
-
-type PostRef struct {
-	ID        uint      `gorm:"primarykey"`
-	CreatedAt time.Time `gorm:"index:idx_post_uid_created"`
-
-	Cid        string
-	Rkey       string `gorm:"uniqueIndex:idx_post_rkeyuid"`
-	Uid        uint   `gorm:"uniqueIndex:idx_post_rkeyuid,index:idx_post_uid_created"`
-	NotFound   bool
-	Likes      int
-	Reposts    int
-	Replies    int
-	ThreadSize int
-	ThreadRoot uint
-	ReplyTo    uint `gorm:"index"`
-	IsReply    bool `gorm:"index"`
-	HasImage   bool
-	Reposting  uint
-}
-
-type Feed struct {
-	gorm.Model
-	Name        string `gorm:"unique"`
-	Description string
-}
-
-type FeedIncl struct {
-	gorm.Model
-	Feed uint `gorm:"uniqueIndex:idx_feed_post"`
-	Post uint `gorm:"uniqueIndex:idx_feed_post"`
-}
-
-type FeedLike struct {
-	ID   uint   `gorm:"primarykey"`
-	Uid  uint   `gorm:"index"`
-	Rkey string `gorm:"index"`
-	Ref  uint
-}
-
-type FeedRepost struct {
-	ID   uint   `gorm:"primarykey"`
-	Uid  uint   `gorm:"index"`
-	Rkey string `gorm:"index"`
-	Ref  uint
-}
-
-type Follow struct {
-	ID        uint   `gorm:"primarykey"`
-	Uid       uint   `gorm:"index"`
-	Following uint   `gorm:"index"`
-	Rkey      string `gorm:"index"`
-}
-
-type Block struct {
-	ID      uint   `gorm:"primarykey"`
-	Uid     uint   `gorm:"index"`
-	Blocked uint   `gorm:"index"`
-	Rkey    string `gorm:"index"`
-}
-
-type User struct {
-	gorm.Model
-	Did    string `gorm:"index"`
-	Handle string
-
-	LatestPost uint
-
-	Blessed        bool
-	Blocked        bool
-	ScrapedFollows bool
-
-	lk sync.Mutex
-}
-
-func (u *User) hasFollowsScraped() bool {
-	u.lk.Lock()
-	defer u.lk.Unlock()
-	return u.ScrapedFollows
 }
 
 type LastSeq struct {
@@ -221,15 +152,15 @@ var runCmd = &cli.Command{
 		}
 
 		log.Info("Migrating database")
-		db.AutoMigrate(&User{})
-		db.AutoMigrate(&Follow{})
+		db.AutoMigrate(&models.User{})
+		db.AutoMigrate(&models.Follow{})
 		db.AutoMigrate(&LastSeq{})
-		db.AutoMigrate(&PostRef{})
-		db.AutoMigrate(&FeedIncl{})
-		db.AutoMigrate(&Feed{})
-		db.AutoMigrate(&FeedLike{})
-		db.AutoMigrate(&FeedRepost{})
-		db.AutoMigrate(&Block{})
+		db.AutoMigrate(&models.PostRef{})
+		db.AutoMigrate(&models.FeedIncl{})
+		db.AutoMigrate(&models.Feed{})
+		db.AutoMigrate(&models.FeedLike{})
+		db.AutoMigrate(&models.FeedRepost{})
+		db.AutoMigrate(&models.Block{})
 
 		log.Infof("Configuring HTTP server")
 		e := echo.New()
@@ -261,7 +192,11 @@ var runCmd = &cli.Command{
 
 		bgshttp := strings.Replace(bgsws, "ws", "http", 1)
 		bgsxrpc := &xrpc.Client{
-			Host: bgshttp,
+			Host:    bgshttp,
+			Headers: map[string]string{},
+		}
+		if rbt := os.Getenv("RATELIMIT_BYPASS_TOKEN"); rbt != "" {
+			bgsxrpc.Headers["X-Ratelimit-Bypass"] = rbt
 		}
 
 		ucache, _ := lru.New(100000)
@@ -288,15 +223,6 @@ var runCmd = &cli.Command{
 
 		mydid := "did:plc:vpkhqolt662uhesyj6nxm7ys"
 		middlebit := mydid + "/app.bsky.feed.generator/"
-
-		allpicsuri := "at://" + middlebit + "allpics"
-		s.AddFeedBuilder(allpicsuri, &AllPicsFeed{
-			name: "allpics",
-			desc: "Every picture posted on the app",
-			s:    s,
-		})
-
-		s.AddProcessor(NewImageLabeler(cctx.String("img-class-host"), s.db, s.xrpcc, s.addPostToFeed))
 
 		// Create some initial feed definitions
 		s.feeds = []feedSpec{
@@ -340,15 +266,34 @@ var runCmd = &cli.Command{
 				Description: "pictures of the flowers (potentially nsfw)",
 				Uri:         "at://" + middlebit + "flowers",
 			},
-			{
-				Name:        "allpics",
-				Description: "Every picture posted on the app",
-				Uri:         "at://" + middlebit + "allpics",
-			},
 		}
 
+		allpicsuri := "at://" + middlebit + "allpics"
+		s.AddFeedBuilder(allpicsuri, &AllPicsFeed{
+			name: "allpics",
+			desc: "Every picture posted on the app",
+			s:    s,
+		})
+
+		allqpsuri := "at://" + middlebit + "allqps"
+		s.AddFeedBuilder(allqpsuri, &QuotePostsFeed{
+			s: s,
+		})
+
+		followpicsuri := "at://" + middlebit + "followpics"
+		s.AddFeedBuilder(followpicsuri, &FollowPics{
+			s: s,
+		})
+
+		cozyuri := "at://" + middlebit + "cozy"
+		s.AddFeedBuilder(cozyuri, &GoodFollows{
+			s: s,
+		})
+
+		s.AddProcessor(NewImageLabeler(cctx.String("img-class-host"), s.db, s.xrpcc, s.addPostToFeed))
+
 		for _, f := range s.feeds {
-			if err := s.db.Create(&Feed{
+			if err := s.db.Create(&models.Feed{
 				Name:        f.Name,
 				Description: f.Description,
 			}).Error; err != nil {
@@ -415,6 +360,12 @@ func (s *Server) AddProcessor(p Processor) {
 func (s *Server) AddFeedBuilder(uri string, fb FeedBuilder) {
 	s.AddProcessor(fb)
 	s.fbm[uri] = fb
+
+	s.feeds = append(s.feeds, feedSpec{
+		Name:        fb.Name(),
+		Description: fb.Description(),
+		Uri:         uri,
+	})
 }
 
 type cachedKey struct {
@@ -482,9 +433,12 @@ type FeedItem struct {
 }
 
 func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
+	ctx, span := otel.Tracer("algoz").Start(e.Request().Context(), "handleGetFeedSkeleton")
+	defer span.End()
 
-	ctx := e.Request().Context()
 	feed := e.QueryParam("feed")
+
+	span.SetAttributes(attribute.String("feed", feed))
 
 	var authedUser *User
 	if auth := e.Request().Header.Get("Authorization"); auth != "" {
@@ -504,10 +458,11 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 
 		u, err := s.getOrCreateUser(ctx, did)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to create user: %w", err)
 		}
 
 		authedUser = u
+		span.SetAttributes(attribute.String("did", u.Did))
 	}
 
 	var limit int = 100
@@ -529,6 +484,8 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 	if c := e.QueryParam("cursor"); c != "" {
 		cursor = &c
 	}
+
+	span.SetAttributes(attribute.Bool("cursor", cursor != nil))
 
 	fb, ok := s.fbm[feed]
 	if ok {
@@ -706,9 +663,7 @@ func (s *Server) scrapeFollowsForUser(ctx context.Context, u *User) error {
 	if err := s.db.Table("users").Where("id = ?", u.ID).Update("scraped_follows", true).Error; err != nil {
 		return err
 	}
-	u.lk.Lock()
-	u.ScrapedFollows = true
-	u.lk.Unlock()
+	u.SetFollowsScraped(true)
 
 	return nil
 }
@@ -751,7 +706,7 @@ func (s *Server) latestPostForUser(ctx context.Context, uid uint) (*PostRef, err
 }
 
 func (s *Server) getMostRecentFromFollows(ctx context.Context, u *User, limit int, cursor *string) ([]*bsky.FeedDefs_SkeletonFeedPost, *string, error) {
-	if !u.hasFollowsScraped() {
+	if !u.HasFollowsScraped() {
 		if err := s.scrapeFollowsForUser(ctx, u); err != nil {
 			return nil, nil, err
 		}
@@ -876,7 +831,9 @@ func (s *Server) getFeedAddOrder(ctx context.Context, feed string, limit int, cu
 }
 
 func (s *Server) getFeed(ctx context.Context, feed string, limit int, cursor *string) ([]*bsky.FeedDefs_SkeletonFeedPost, *string, error) {
-	log.Infof("serving %s", feed)
+	ctx, span := otel.Tracer("algoz").Start(ctx, "getFeed")
+	defer span.End()
+
 	f, err := s.getFeedRef(ctx, feed)
 	if err != nil {
 		return nil, nil, err
@@ -894,6 +851,10 @@ func (s *Server) getFeed(ctx context.Context, feed string, limit int, cursor *st
 	}
 	if err := q.Find(&posts).Error; err != nil {
 		return nil, nil, err
+	}
+
+	if len(posts) == 0 {
+		return []*bsky.FeedDefs_SkeletonFeedPost{}, nil, nil
 	}
 
 	skelposts, err := s.postsToFeed(ctx, posts)
@@ -942,8 +903,13 @@ func (s *Server) deleteLike(ctx context.Context, u *User, path string) error {
 	rkey := parts[len(parts)-1]
 
 	var lk FeedLike
-	if err := s.db.First(&lk, "uid = ? AND rkey = ?", u.ID, rkey).Error; err != nil {
+	if err := s.db.Find(&lk, "uid = ? AND rkey = ?", u.ID, rkey).Error; err != nil {
 		return err
+	}
+
+	if lk.ID == 0 {
+		log.Warnf("handling delete with no record reference: %s %s", u.Did, path)
+		return nil
 	}
 
 	return s.db.Transaction(func(tx *gorm.DB) error {
@@ -1033,7 +999,7 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 		if rec.Embed.EmbedRecordWithMedia != nil {
 			rpref = rec.Embed.EmbedRecordWithMedia.Record.Record.Uri
 		}
-		if rpref != "" && strings.Contains(rec.Embed.EmbedRecord.Record.Uri, "app.bsky.feed.post") {
+		if rpref != "" && strings.Contains(rpref, "app.bsky.feed.post") {
 			rp, err := s.getPostByUri(ctx, rpref)
 			if err != nil {
 				return err
@@ -1088,13 +1054,13 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 }
 
 func (s *Server) setUserLastPost(u *User, p *PostRef) error {
-	u.lk.Lock()
-	if err := s.db.Table("users").Where("id = ?", u.ID).Update("latest_post", p.ID).Error; err != nil {
-		return err
-	}
-	u.LatestPost = p.ID
-	u.lk.Unlock()
-	return nil
+	return u.DoLocked(func() error {
+		if err := s.db.Table("users").Where("id = ?", u.ID).Update("latest_post", p.ID).Error; err != nil {
+			return err
+		}
+		u.LatestPost = p.ID
+		return nil
+	})
 }
 
 func (s *Server) incrementReplyTo(ctx context.Context, uri string) error {
@@ -1304,11 +1270,15 @@ func (s *Server) handleFollow(ctx context.Context, u *User, rec *bsky.GraphFollo
 		return err
 	}
 
-	if err := s.db.Create(&Follow{
+	f := &Follow{
 		Uid:       u.ID,
 		Rkey:      parts[len(parts)-1],
 		Following: target.ID,
-	}).Error; err != nil {
+	}
+	if err := s.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "uid"}, {Name: "following"}},
+		DoNothing: true,
+	}).Create(f).Error; err != nil {
 		return err
 	}
 

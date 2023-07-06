@@ -17,6 +17,7 @@ import (
 	"github.com/bluesky-social/indigo/repomgr"
 	"github.com/gorilla/websocket"
 	"github.com/ipfs/go-cid"
+	. "github.com/whyrusleeping/algoz/models"
 )
 
 func (s *Server) getLastCursor() (int64, error) {
@@ -238,8 +239,8 @@ func (s *Server) getOrCreateUser(ctx context.Context, did string) (*User, error)
 	if ok {
 		s.userLk.Unlock()
 		u := cu.(*User)
-		u.lk.Lock()
-		u.lk.Unlock()
+		u.Lk.Lock()
+		u.Lk.Unlock()
 		if u.ID == 0 {
 			return nil, fmt.Errorf("user creation failed")
 		}
@@ -250,8 +251,8 @@ func (s *Server) getOrCreateUser(ctx context.Context, did string) (*User, error)
 	var u User
 	s.userCache.Add(did, &u)
 
-	u.lk.Lock()
-	defer u.lk.Unlock()
+	u.Lk.Lock()
+	defer u.Lk.Unlock()
 	s.userLk.Unlock()
 
 	if err := s.db.Find(&u, "did = ?", did).Error; err != nil {
@@ -278,7 +279,7 @@ func (s *Server) getOrCreateUser(ctx context.Context, did string) (*User, error)
 }
 
 func (s *Server) handleFromDid(ctx context.Context, did string) (string, error) {
-	handle, _, err := api.ResolveDidToHandle(ctx, s.xrpcc, s.didr, did)
+	handle, _, err := api.ResolveDidToHandle(ctx, s.xrpcc, s.didr, &api.ProdHandleResolver{}, did)
 	if err != nil {
 		return "", err
 	}

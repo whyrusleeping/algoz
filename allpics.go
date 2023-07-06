@@ -4,6 +4,7 @@ import (
 	"context"
 
 	bsky "github.com/bluesky-social/indigo/api/bsky"
+	. "github.com/whyrusleeping/algoz/models"
 )
 
 type AllPicsFeed struct {

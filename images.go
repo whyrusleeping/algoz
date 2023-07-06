@@ -7,6 +7,7 @@ import (
 	"github.com/bluesky-social/indigo/api/atproto"
 	bsky "github.com/bluesky-social/indigo/api/bsky"
 	"github.com/bluesky-social/indigo/xrpc"
+	. "github.com/whyrusleeping/algoz/models"
 	"gorm.io/gorm"
 )
 
