@@ -290,6 +290,11 @@ var runCmd = &cli.Command{
 			s: s,
 		})
 
+		enjoyuri := "at://" + middlebit + "enjoy"
+		s.AddFeedBuilder(enjoyuri, &EnjoyFeed{
+			s: s,
+		})
+
 		s.AddProcessor(NewImageLabeler(cctx.String("img-class-host"), s.db, s.xrpcc, s.addPostToFeed))
 
 		for _, f := range s.feeds {
