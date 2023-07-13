@@ -32,13 +32,27 @@ func (f *FollowPics) GetFeed(ctx context.Context, u *User, limit int, cursor *st
 		return nil, err
 	}
 
+	qs := `SELECT post_refs.* 
+FROM "post_refs"
+INNER JOIN (
+    SELECT "post" FROM "feed_incls" WHERE "feed" = ?
+) AS feed_incls_filtered ON post_refs.id = feed_incls_filtered.post 
+INNER JOIN (
+    SELECT "following" FROM "follows" WHERE "uid" = ?
+) AS follows_filtered ON post_refs.uid = follows_filtered.following 
+ORDER BY post_refs.created_at DESC 
+LIMIT ?;`
+
 	var out []PostRef
-	q := f.s.db.Table("feed_incls").
-		Joins("INNER JOIN post_refs on post_refs.id = feed_incls.post").
-		Joins("INNER JOIN follows on post_refs.uid = follows.following").
-		Where("feed_incls.feed = ?", fr.ID).
-		Where("follows.uid = ?", u.ID).
-		Select("post_refs.*").Order("post_refs.created_at desc").Limit(limit)
+	q := f.s.db.Raw(qs, fr.ID, u.ID, limit)
+	/*
+		q := f.s.db.Table("feed_incls").
+			Joins("INNER JOIN post_refs on post_refs.id = feed_incls.post").
+			Joins("INNER JOIN follows on post_refs.uid = follows.following").
+			Where("feed_incls.feed = ?", fr.ID).
+			Where("follows.uid = ?", u.ID).
+			Select("post_refs.*").Order("post_refs.created_at desc").Limit(limit)
+	*/
 	if cursor != nil {
 		t, err := time.Parse(time.RFC3339, *cursor)
 		if err != nil {
