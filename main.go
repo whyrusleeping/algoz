@@ -741,8 +741,10 @@ func (s *Server) getMostRecentFromFollows(ctx context.Context, u *User, limit in
 		start = num
 	}
 
+	seed := time.Now().YearDay()
+	pseudoRandomHashExpression := "ABS(SIN(CAST((follows.id + ?) as REAL) * 7423.7423 + 137)) * 10000"
 	var fusers []User
-	if err := s.db.Table("follows").Joins("LEFT JOIN users on follows.following = users.id").Where("follows.uid = ?", u.ID).Limit(limit).Offset(start).Order("follows.id ASC").Scan(&fusers).Error; err != nil {
+	if err := s.db.Table("follows").Joins("LEFT JOIN users on follows.following = users.id").Where("follows.uid = ?", u.ID).Limit(limit).Offset(start).Order(gorm.Expr(pseudoRandomHashExpression, seed)).Scan(&fusers).Error; err != nil {
 		return nil, nil, err
 	}
 
@@ -762,7 +764,7 @@ func (s *Server) getMostRecentFromFollows(ctx context.Context, u *User, limit in
 		Where("follows.uid = ?", u.ID).
 		Limit(limit).
 		Offset(start).
-		Order("follows.id ASC").
+		Order(gorm.Expr(pseudoRandomHashExpression, seed)).
 		Scan(&out).Error; err != nil {
 		return nil, nil, err
 	}
