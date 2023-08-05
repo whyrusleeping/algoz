@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -741,10 +742,18 @@ func (s *Server) getMostRecentFromFollows(ctx context.Context, u *User, limit in
 		start = num
 	}
 
-	seed := time.Now().YearDay()
-	pseudoRandomHashExpression := "ABS(SIN(CAST((follows.id + ?) as REAL) * 7423.7423 + 137)) * 10000"
+	// Generate random number for current day
+	seedseed := time.Now().YearDay()
+	r := rand.New(rand.NewSource(int64(seedseed)))
+	seed := r.Intn(65536)
+
+	pseudoRandomHashExpression := "CAST(ABS((CAST(follows.id as REAL) * CAST(follows.id as REAL) + ?) % 65536 * 13107) as INTEGER)"
+
 	var fusers []User
-	if err := s.db.Table("follows").Joins("LEFT JOIN users on follows.following = users.id").Where("follows.uid = ?", u.ID).Limit(limit).Offset(start).Order(gorm.Expr(pseudoRandomHashExpression, seed)).Scan(&fusers).Error; err != nil {
+	if err := s.db.Table("follows").Joins("LEFT JOIN users on follows.following = users.id").Where("follows.uid = ?", u.ID).Limit(limit).Offset(start).Clauses(
+		clause.OrderBy{
+			Expression: gorm.Expr(pseudoRandomHashExpression, seed),
+		}).Scan(&fusers).Error; err != nil {
 		return nil, nil, err
 	}
 
@@ -763,8 +772,10 @@ func (s *Server) getMostRecentFromFollows(ctx context.Context, u *User, limit in
 		Joins("INNER JOIN post_refs on users.latest_post = post_refs.id").
 		Where("follows.uid = ?", u.ID).
 		Limit(limit).
-		Offset(start).
-		Order(gorm.Expr(pseudoRandomHashExpression, seed)).
+		Offset(start).Clauses(
+		clause.OrderBy{
+			Expression: gorm.Expr(pseudoRandomHashExpression, seed),
+		}).
 		Scan(&out).Error; err != nil {
 		return nil, nil, err
 	}
