@@ -70,6 +70,11 @@ type LastSeq struct {
 	Seq int64
 }
 
+type UserAssoc struct {
+	Uid   uint   `gorm:"index"`
+	Assoc string `gorm:"index"`
+}
+
 func main() {
 	app := cli.NewApp()
 
@@ -161,6 +166,7 @@ var runCmd = &cli.Command{
 		db.AutoMigrate(&models.FeedLike{})
 		db.AutoMigrate(&models.FeedRepost{})
 		db.AutoMigrate(&models.Block{})
+		db.AutoMigrate(&UserAssoc{})
 
 		log.Infof("Configuring HTTP server")
 		e := echo.New()
