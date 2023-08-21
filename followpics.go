@@ -90,6 +90,6 @@ func (f *FollowPics) HandleLike(context.Context, *User, *bsky.FeedPost) error {
 	return nil
 }
 
-func (f *FollowPics) HandleRepost(context.Context, *User, *bsky.FeedPost) error {
+func (f *FollowPics) HandleRepost(context.Context, *User, *PostRef, string) error {
 	return nil
 }

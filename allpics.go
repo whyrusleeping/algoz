@@ -51,6 +51,6 @@ func (f *AllPicsFeed) HandleLike(context.Context, *User, *bsky.FeedPost) error {
 	return nil
 }
 
-func (f *AllPicsFeed) HandleRepost(context.Context, *User, *bsky.FeedPost) error {
+func (f *AllPicsFeed) HandleRepost(context.Context, *User, *PostRef, string) error {
 	return nil
 }

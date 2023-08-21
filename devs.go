@@ -53,13 +53,27 @@ var devwords = []string{
 	"kubernetes",
 	"linux",
 	"bash",
+	"https",
+	"graph",
+	"http",
+	"xrpc",
+	"usb-c",
+	"solder",
+	"logging",
+	"protocol",
+	"server",
+	"gamedev",
+	"federation",
+	"binary",
 }
 
 var devset map[string]bool
 
 func init() {
+	devset = make(map[string]bool)
 	for _, w := range devwords {
 		devset[w] = true
+		devset["#"+w] = true
 	}
 }
 
@@ -77,7 +91,7 @@ func containsDevKeywords(txt string) bool {
 
 func (f *DevFeed) userIsDev(ctx context.Context, u *User) (bool, error) {
 	var id uint
-	if err := f.s.db.Model(&UserAssoc{}).Where("uid = ? AND assoc = ?", u.ID, "dev").Select("id").Scan(&id).Error; err != nil {
+	if err := f.s.db.Model(&UserAssoc{}).Where("uid = ? AND assoc = ?", u.ID, "dev").Select("uid").Scan(&id).Error; err != nil {
 		return false, err
 	}
 
@@ -85,7 +99,7 @@ func (f *DevFeed) userIsDev(ctx context.Context, u *User) (bool, error) {
 }
 
 func (f *DevFeed) HandlePost(ctx context.Context, u *User, pr *PostRef, fp *bsky.FeedPost) error {
-	if strings.Contains(fp.Text, "#atdev") {
+	if strings.Contains(fp.Text, "#atdev") || strings.Contains(fp.Text, "#atproto") {
 		if err := f.s.addPostToFeed(ctx, "devfeed", pr); err != nil {
 			return err
 		}
@@ -110,6 +124,17 @@ func (f *DevFeed) HandleLike(context.Context, *User, *bsky.FeedPost) error {
 	return nil
 }
 
-func (f *DevFeed) HandleRepost(ctx context.Context, u *User, fp *bsky.FeedPost) error {
+func (f *DevFeed) HandleRepost(ctx context.Context, u *User, pref *PostRef, text string) error {
+	isDev, err := f.userIsDev(ctx, u)
+	if err != nil {
+		return err
+	}
+	if isDev {
+		if containsDevKeywords(text) {
+			if err := f.s.addPostToFeed(ctx, "devfeed", pref); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }

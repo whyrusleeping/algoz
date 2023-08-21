@@ -48,6 +48,6 @@ func (f *QuotePostsFeed) HandleLike(context.Context, *User, *bsky.FeedPost) erro
 	return nil
 }
 
-func (f *QuotePostsFeed) HandleRepost(context.Context, *User, *bsky.FeedPost) error {
+func (f *QuotePostsFeed) HandleRepost(context.Context, *User, *PostRef, string) error {
 	return nil
 }

@@ -62,7 +62,7 @@ type Labeler interface {
 type Processor interface {
 	HandlePost(context.Context, *User, *PostRef, *bsky.FeedPost) error
 	HandleLike(context.Context, *User, *bsky.FeedPost) error
-	HandleRepost(context.Context, *User, *bsky.FeedPost) error
+	HandleRepost(context.Context, *User, *PostRef, string) error
 }
 
 type LastSeq struct {
@@ -73,6 +73,12 @@ type LastSeq struct {
 type UserAssoc struct {
 	Uid   uint   `gorm:"index"`
 	Assoc string `gorm:"index"`
+}
+
+type PostText struct {
+	gorm.Model
+	Post uint `gorm:"uniqueIndex"`
+	Text string
 }
 
 func main() {
@@ -167,6 +173,7 @@ var runCmd = &cli.Command{
 		db.AutoMigrate(&models.FeedRepost{})
 		db.AutoMigrate(&models.Block{})
 		db.AutoMigrate(&UserAssoc{})
+		db.AutoMigrate(&PostText{})
 
 		log.Infof("Configuring HTTP server")
 		e := echo.New()
@@ -298,6 +305,11 @@ var runCmd = &cli.Command{
 
 		enjoyuri := "at://" + middlebit + "enjoy"
 		s.AddFeedBuilder(enjoyuri, &EnjoyFeed{
+			s: s,
+		})
+
+		devfeeduri := "at://" + middlebit + "devfeed"
+		s.AddFeedBuilder(devfeeduri, &DevFeed{
 			s: s,
 		})
 
@@ -1055,11 +1067,12 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 		}
 	}
 
-	/*
-		if err := s.addPostToFeed(ctx, "nsfw", pref); err != nil {
-			return err
-		}
-	*/
+	if err := s.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&PostText{
+		Post: pref.ID,
+		Text: rec.Text,
+	}).Error; err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -1268,6 +1281,17 @@ func (s *Server) handleRepost(ctx context.Context, u *User, rec *bsky.FeedRepost
 
 	if err := s.db.Model(&PostRef{}).Where("id = ?", p.ID).Update("reposts", gorm.Expr("reposts + 1")).Error; err != nil {
 		return err
+	}
+
+	var ptext PostText
+	if err := s.db.Find(&ptext, "post = ?", p.ID).Error; err != nil {
+		return err
+	}
+
+	for _, proc := range s.processors {
+		if err := proc.HandleRepost(ctx, u, p, ptext.Text); err != nil {
+			return err
+		}
 	}
 
 	return nil

@@ -81,6 +81,6 @@ func (il *ImageLabeler) HandleLike(context.Context, *User, *bsky.FeedPost) error
 	return nil
 }
 
-func (il *ImageLabeler) HandleRepost(context.Context, *User, *bsky.FeedPost) error {
+func (il *ImageLabeler) HandleRepost(context.Context, *User, *PostRef, string) error {
 	return nil
 }
