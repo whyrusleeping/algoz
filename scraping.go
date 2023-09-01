@@ -12,6 +12,7 @@ import (
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	bsky "github.com/bluesky-social/indigo/api/bsky"
 	"github.com/bluesky-social/indigo/events"
+	"github.com/bluesky-social/indigo/events/schedulers/autoscaling"
 	lexutil "github.com/bluesky-social/indigo/lex/util"
 	"github.com/bluesky-social/indigo/repo"
 	"github.com/bluesky-social/indigo/repomgr"
@@ -43,7 +44,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("get last cursor: %w", err)
 	}
 
-	pool := events.NewConsumerPool(16, 32, func(ctx context.Context, xe *events.XRPCStreamEvent) error {
+	handleFunc := func(ctx context.Context, xe *events.XRPCStreamEvent) error {
 		switch {
 		case xe.RepoCommit != nil:
 			evt := xe.RepoCommit
@@ -106,7 +107,7 @@ func (s *Server) Run(ctx context.Context) error {
 		default:
 			return nil
 		}
-	})
+	}
 
 	var backoff time.Duration
 	for {
@@ -125,7 +126,8 @@ func (s *Server) Run(ctx context.Context) error {
 
 		backoff = 0
 
-		if err := events.HandleRepoStream(ctx, con, pool); err != nil {
+		sched := autoscaling.NewScheduler(autoscaling.DefaultAutoscaleSettings(), "", handleFunc)
+		if err := events.HandleRepoStream(ctx, con, sched); err != nil {
 			log.Errorf("stream processing error: %s", err)
 
 		}

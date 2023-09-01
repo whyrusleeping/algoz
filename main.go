@@ -14,11 +14,10 @@ import (
 	api "github.com/bluesky-social/indigo/api"
 	"github.com/bluesky-social/indigo/api/atproto"
 	bsky "github.com/bluesky-social/indigo/api/bsky"
-	cliutil "github.com/bluesky-social/indigo/cmd/gosky/util"
 	"github.com/bluesky-social/indigo/did"
 	"github.com/bluesky-social/indigo/util"
+	cliutil "github.com/bluesky-social/indigo/util/cliutil"
 	"github.com/bluesky-social/indigo/xrpc"
-	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	es256k "github.com/ericvolp12/jwt-go-secp256k1"
 	"github.com/golang-jwt/jwt"
 	lru "github.com/hashicorp/golang-lru"
@@ -28,6 +27,7 @@ import (
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/whyrusleeping/algoz/models"
 	. "github.com/whyrusleeping/algoz/models"
+	"gitlab.com/yawning/secp256k1-voi/secec"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/crypto/acme/autocert"
@@ -157,7 +157,7 @@ var runCmd = &cli.Command{
 	Action: func(cctx *cli.Context) error {
 
 		log.Info("Connecting to database")
-		db, err := cliutil.SetupDatabase(cctx.String("database-url"))
+		db, err := cliutil.SetupDatabase(cctx.String("database-url"), 40)
 		if err != nil {
 			return err
 		}
@@ -409,14 +409,12 @@ func (s *Server) getKeyForDid(did string) (any, error) {
 
 	switch pubk.Type {
 	case "EcdsaSecp256k1VerificationKey2019":
-		pub, err := secp256k1.ParsePubKey(pubk.Raw.([]byte))
-		if err != nil {
+		seck, ok := pubk.Raw.(*secec.PublicKey)
+		if !ok {
 			return nil, fmt.Errorf("pubkey was invalid: %w", err)
 		}
 
-		ecp := pub.ToECDSA()
-
-		return ecp, nil
+		return seck, nil
 	default:
 		return nil, fmt.Errorf("unrecognized key type: %q", pubk.Type)
 
@@ -470,13 +468,11 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 			return fmt.Errorf("invalid auth header")
 		}
 
-		p := new(jwt.Parser)
-		p.ValidMethods = []string{es256k.SigningMethodES256K.Alg()}
-		tok, err := p.Parse(parts[1], s.fetchKey)
+		did, err := s.checkJwt(ctx, parts[1])
 		if err != nil {
 			return err
 		}
-		did := tok.Claims.(jwt.MapClaims)["iss"].(string)
+
 		//did := "did:plc:vpkhqolt662uhesyj6nxm7ys"
 
 		u, err := s.getOrCreateUser(ctx, did)
@@ -578,6 +574,17 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 			Message: "no such feed",
 		}
 	}
+}
+
+func (s *Server) checkJwt(ctx context.Context, tokv string) (string, error) {
+	p := new(jwt.Parser)
+	p.ValidMethods = []string{es256k.SigningMethodES256K.Alg()}
+	tok, err := p.Parse(tokv, s.fetchKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse jwt: %w", err)
+	}
+	did := tok.Claims.(jwt.MapClaims)["iss"].(string)
+	return did, nil
 }
 
 func (s *Server) getWhatsLit(ctx context.Context, limit int, cursor *string) ([]*bsky.FeedDefs_SkeletonFeedPost, *string, error) {

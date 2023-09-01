@@ -65,6 +65,8 @@ var devwords = []string{
 	"gamedev",
 	"federation",
 	"binary",
+	"python",
+	"implementation",
 }
 
 var devset map[string]bool
@@ -99,7 +101,7 @@ func (f *DevFeed) userIsDev(ctx context.Context, u *User) (bool, error) {
 }
 
 func (f *DevFeed) HandlePost(ctx context.Context, u *User, pr *PostRef, fp *bsky.FeedPost) error {
-	if strings.Contains(fp.Text, "#atdev") || strings.Contains(fp.Text, "#atproto") {
+	if strings.Contains(fp.Text, "#atdev") || strings.Contains(fp.Text, "#atproto") || strings.Contains(fp.Text, "github.com/bluesky-social") {
 		if err := f.s.addPostToFeed(ctx, "devfeed", pr); err != nil {
 			return err
 		}
