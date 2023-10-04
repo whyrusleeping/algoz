@@ -1,10 +1,11 @@
 module github.com/whyrusleeping/algoz
 
-go 1.20
+go 1.21
+
+toolchain go1.21.0
 
 require (
 	github.com/bluesky-social/indigo v0.0.0-20230830042519-9caaa233dc6b
-	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.2.0
 	github.com/ericvolp12/jwt-go-secp256k1 v0.0.2
 	github.com/golang-jwt/jwt v3.2.2+incompatible
 	github.com/gorilla/websocket v1.5.0
@@ -13,6 +14,7 @@ require (
 	github.com/ipfs/go-log v1.0.5
 	github.com/labstack/echo/v4 v4.10.2
 	github.com/urfave/cli/v2 v2.25.3
+	gitlab.com/yawning/secp256k1-voi v0.0.0-20230815035612-a7264edccf80
 	go.opentelemetry.io/otel v1.16.0
 	golang.org/x/crypto v0.12.0
 	gorm.io/gorm v1.25.1
@@ -22,6 +24,7 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.2 // indirect
+	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.2.0 // indirect
 	github.com/felixge/httpsnoop v1.0.3 // indirect
 	github.com/go-logr/logr v1.2.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -95,7 +98,6 @@ require (
 	github.com/whyrusleeping/cbor-gen v0.0.0-20230818171029-f91ae536ca25 // indirect
 	github.com/whyrusleeping/go-did v0.0.0-20230824162731-404d1707d5d6 // indirect
 	github.com/xrash/smetrics v0.0.0-20201216005158-039620a65673 // indirect
-	gitlab.com/yawning/secp256k1-voi v0.0.0-20230815035612-a7264edccf80 // indirect
 	gitlab.com/yawning/tuplehash v0.0.0-20230713102510-df83abbf9a02 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.42.0 // indirect
 	go.opentelemetry.io/otel/metric v1.16.0 // indirect

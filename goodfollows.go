@@ -45,7 +45,7 @@ p1.created_at > ?
 ORDER BY p1.created_at DESC;`
 
 	var all []PostRef
-	if err := f.s.db.Debug().Raw(q, u.ID, curs.From, curs.To).Scan(&all).Error; err != nil {
+	if err := f.s.db.Debug().Raw(q, u.ID, curs.Late, curs.Early).Scan(&all).Error; err != nil {
 		return nil, err
 	}
 
@@ -55,21 +55,21 @@ ORDER BY p1.created_at DESC;`
 type goodFollowCursor struct {
 	User   uint
 	Offset int
-	From   time.Time
-	To     time.Time
+	Late   time.Time
+	Early  time.Time
 }
 
 func (c *goodFollowCursor) advance() *goodFollowCursor {
 	return &goodFollowCursor{
-		From:   c.To,
-		To:     c.To.Add(cozyBucketWidth),
+		Late:   c.Early,
+		Early:  c.Early.Add(-1 * cozyBucketWidth),
 		Offset: 0,
 		User:   c.User,
 	}
 }
 
 func (c *goodFollowCursor) toString() string {
-	return fmt.Sprintf("%d:%d:%x:%x", c.User, c.Offset, c.From.Format(time.RFC3339), c.To.Format(time.RFC3339))
+	return fmt.Sprintf("%d:%d:%x:%x", c.User, c.Offset, c.Late.Format(time.RFC3339), c.Early.Format(time.RFC3339))
 }
 
 func parseGfc(curs string) (*goodFollowCursor, error) {
@@ -111,8 +111,8 @@ func parseGfc(curs string) (*goodFollowCursor, error) {
 	return &goodFollowCursor{
 		User:   uint(u),
 		Offset: off,
-		From:   ft,
-		To:     tt,
+		Late:   ft,
+		Early:  tt,
 	}, nil
 }
 
@@ -128,8 +128,8 @@ func (f *GoodFollows) GetFeed(ctx context.Context, u *User, lim int, curs *strin
 		}
 	}
 
-	now := time.Now()
-	end := now.Add(-1 * cozyBucketWidth)
+	late := time.Now()
+	early := late.Add(-1 * cozyBucketWidth)
 
 	var cursor *goodFollowCursor
 	if curs != nil {
@@ -141,9 +141,9 @@ func (f *GoodFollows) GetFeed(ctx context.Context, u *User, lim int, curs *strin
 		cursor = gfc
 	} else {
 		cursor = &goodFollowCursor{
-			User: u.ID,
-			From: now,
-			To:   end,
+			User:  u.ID,
+			Late:  late,
+			Early: early,
 		}
 	}
 
