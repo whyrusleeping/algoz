@@ -313,6 +313,13 @@ var runCmd = &cli.Command{
 			s: s,
 		})
 
+		folikeuri := "at://" + middlebit + "followlikes"
+		flc, _ := lru.New(10000)
+		s.AddFeedBuilder(folikeuri, &FollowLikes{
+			s:     s,
+			cache: flc,
+		})
+
 		s.AddProcessor(NewImageLabeler(cctx.String("img-class-host"), s.db, s.xrpcc, s.addPostToFeed))
 
 		for _, f := range s.feeds {
@@ -787,7 +794,7 @@ func (s *Server) getMostRecentFromFollows(ctx context.Context, u *User, limit in
 		Where("follows.uid = ?", u.ID).
 		Limit(limit).
 		Offset(start).
-		Order("follows.id ASC").
+		Order("post_refs.created_at DESC").
 		Scan(&out).Error; err != nil {
 		return nil, nil, err
 	}
@@ -947,7 +954,7 @@ func (s *Server) deleteLike(ctx context.Context, u *User, path string) error {
 			return err
 		}
 
-		return tx.Delete(&lk).Error
+		return tx.Delete(&FeedLike{}, "id = ?", lk.ID).Error
 	})
 }
 
@@ -1131,7 +1138,7 @@ func (s *Server) getPostByUri(ctx context.Context, uri string) (*PostRef, error)
 
 		rec, rcid, err := s.getRecord(ctx, uri)
 		if err != nil {
-			log.Error("failed to fetch missing record: %s", err)
+			log.Errorf("failed to fetch missing record: %s", err)
 		} else {
 			crt, err := time.Parse(util.ISO8601, rec.CreatedAt)
 			if err != nil {
