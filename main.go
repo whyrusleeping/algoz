@@ -314,11 +314,7 @@ var runCmd = &cli.Command{
 		})
 
 		folikeuri := "at://" + middlebit + "followlikes"
-		flc, _ := lru.New(10000)
-		s.AddFeedBuilder(folikeuri, &FollowLikes{
-			s:     s,
-			cache: flc,
-		})
+		s.AddFeedBuilder(folikeuri, NewFollowLikes(s))
 
 		s.AddProcessor(NewImageLabeler(cctx.String("img-class-host"), s.db, s.xrpcc, s.addPostToFeed))
 
