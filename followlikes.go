@@ -29,12 +29,16 @@ func NewFollowLikes(s *Server) *FollowLikes {
 	c, _ := lru.New(20000)
 	fc, _ := lru.New(200_000)
 
-	return &FollowLikes{
+	fl := &FollowLikes{
 		s:           s,
 		postsCache:  c,
 		followCache: fc,
 		lastLoad:    TID(time.Now().Add(time.Hour * -24)),
 	}
+
+	go fl.refresher()
+
+	return fl
 }
 
 func (fl *FollowLikes) refresher() {
@@ -101,19 +105,6 @@ func (f *FollowLikes) addLikeUnlock(like *FeedLike) {
 			f.chunks = f.chunks[1:]
 		}
 	}
-
-	last.append(like)
-}
-
-func (f *FollowLikes) addLike(like *FeedLike) {
-	f.lk.Lock()
-	last := f.chunks[len(f.chunks)-1]
-	if last.isFull() {
-		next := &likeChunk{}
-		f.chunks = append(f.chunks, next)
-		last = next
-	}
-	f.lk.Unlock()
 
 	last.append(like)
 }
