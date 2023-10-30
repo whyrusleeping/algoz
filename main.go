@@ -960,8 +960,12 @@ func (s *Server) deleteRepost(ctx context.Context, u *User, path string) error {
 	rkey := parts[len(parts)-1]
 
 	var rp FeedRepost
-	if err := s.db.First(&rp, "uid = ? AND rkey = ?", u.ID, rkey).Error; err != nil {
+	if err := s.db.Find(&rp, "uid = ? AND rkey = ?", u.ID, rkey).Error; err != nil {
 		return err
+	}
+
+	if rp.ID == 0 {
+		return fmt.Errorf("could not find repost: uid=%d, %s", u.ID, path)
 	}
 
 	return s.db.Transaction(func(tx *gorm.DB) error {

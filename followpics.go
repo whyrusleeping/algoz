@@ -27,24 +27,16 @@ func (f *FollowPics) GetFeed(ctx context.Context, u *User, limit int, cursor *st
 		}
 	}
 
-	fr, err := f.s.getFeedRef(ctx, "allpics")
-	if err != nil {
-		return nil, err
-	}
-
-	qs := `SELECT post_refs.* 
+	qs := `SELECT * 
 FROM "post_refs"
-INNER JOIN (
-    SELECT "post" FROM "feed_incls" WHERE "feed" = ?
-) AS feed_incls_filtered ON post_refs.id = feed_incls_filtered.post 
-INNER JOIN (
-    SELECT "following" FROM "follows" WHERE "uid" = ?
-) AS follows_filtered ON post_refs.uid = follows_filtered.following 
+WHERE has_image AND uid in ( 
+	SELECT "following" FROM "follows" WHERE "uid" = ?
+	)
 ORDER BY post_refs.created_at DESC 
 LIMIT ?;`
 
 	var out []PostRef
-	q := f.s.db.Raw(qs, fr.ID, u.ID, limit)
+	q := f.s.db.Debug().Raw(qs, u.ID, limit)
 	/*
 		q := f.s.db.Table("feed_incls").
 			Joins("INNER JOIN post_refs on post_refs.id = feed_incls.post").

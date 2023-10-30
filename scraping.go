@@ -199,7 +199,8 @@ func (s *Server) handleOp(ctx context.Context, op repomgr.EventKind, seq int64, 
 		}
 	}
 
-	if seq%50 == 0 {
+	if seq%200 == 0 {
+		log.Infof("updating cursor: %d", seq)
 		if err := s.updateLastCursor(seq); err != nil {
 			log.Error("Failed to update cursor: ", err)
 		}
