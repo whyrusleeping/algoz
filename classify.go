@@ -66,5 +66,9 @@ func (ic *ImageClassifier) Classify(ctx context.Context, img []byte) (string, er
 		return "", err
 	}
 
-	return out["category"].(string), nil
+	c, ok := out["category"].(string)
+	if !ok {
+		return "", fmt.Errorf("no category in response")
+	}
+	return c, nil
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	bsky "github.com/bluesky-social/indigo/api/bsky"
@@ -27,16 +28,33 @@ func (f *FollowPics) GetFeed(ctx context.Context, u *User, limit int, cursor *st
 		}
 	}
 
-	qs := `SELECT * 
+	oldest := time.Now().Add(time.Hour * -24)
+
+	params := []any{u.ID, oldest, limit}
+	var extra string
+	if cursor != nil {
+		t, err := time.Parse(time.RFC3339, *cursor)
+		if err != nil {
+			return nil, err
+		}
+
+		oldest = t.Add(time.Hour * -24)
+
+		extra = "AND post_refs.created_at < ?"
+		params = []any{u.ID, oldest, t, limit}
+	}
+
+	qs := fmt.Sprintf(`SELECT post_refs.* 
 FROM "post_refs"
-WHERE has_image AND uid in ( 
-	SELECT "following" FROM "follows" WHERE "uid" = ?
-	)
+INNER JOIN follows ON follows.uid = ? AND follows.following = post_refs.uid
+WHERE has_image 
+AND post_refs.created_at > ?
+%s
 ORDER BY post_refs.created_at DESC 
-LIMIT ?;`
+LIMIT ?;`, extra)
 
 	var out []PostRef
-	q := f.s.db.Debug().Raw(qs, u.ID, limit)
+	q := f.s.db.Debug().Raw(qs, params...)
 	/*
 		q := f.s.db.Table("feed_incls").
 			Joins("INNER JOIN post_refs on post_refs.id = feed_incls.post").
@@ -45,14 +63,6 @@ LIMIT ?;`
 			Where("follows.uid = ?", u.ID).
 			Select("post_refs.*").Order("post_refs.created_at desc").Limit(limit)
 	*/
-	if cursor != nil {
-		t, err := time.Parse(time.RFC3339, *cursor)
-		if err != nil {
-			return nil, err
-		}
-
-		q = q.Where("post_refs.created_at < ?", t)
-	}
 	if err := q.Find(&out).Error; err != nil {
 		return nil, err
 	}

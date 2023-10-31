@@ -10,8 +10,15 @@ import (
 
 	bsky "github.com/bluesky-social/indigo/api/bsky"
 	lru "github.com/hashicorp/golang-lru"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	. "github.com/whyrusleeping/algoz/models"
 )
+
+var fanoutCachedUsers = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "algo_followlikes_live_user_count",
+	Help: "Number of live users we are fanning out posts for",
+})
 
 type FollowLikes struct {
 	s           *Server
@@ -20,6 +27,9 @@ type FollowLikes struct {
 
 	lk     sync.Mutex
 	chunks []*likeChunk
+
+	lulk      sync.Mutex
+	liveUsers map[uint]*liveUserCache
 
 	lastLoad    string
 	lastRefresh time.Time
@@ -34,9 +44,11 @@ func NewFollowLikes(s *Server) *FollowLikes {
 		postsCache:  c,
 		followCache: fc,
 		lastLoad:    TID(time.Now().Add(time.Hour * -24)),
+		liveUsers:   make(map[uint]*liveUserCache),
 	}
 
 	go fl.refresher()
+	go fl.janitor()
 
 	return fl
 }
@@ -54,25 +66,25 @@ func (fl *FollowLikes) refresher() {
 const chunkSize = 2000
 
 func (fl *FollowLikes) refreshLikes() error {
-	fl.lk.Lock()
-	defer fl.lk.Unlock()
 	if time.Since(fl.lastRefresh) < time.Minute {
 		return nil
 	}
 
 	start := time.Now()
 	defer func() {
-		fmt.Println("followLikes setup took: ", time.Since(start))
+		log.Infof("followLikes setup took: %s", time.Since(start))
 	}()
 
 	var likes []*FeedLike
-	if err := fl.s.db.Find(&likes, "rkey > ?", fl.lastLoad).Error; err != nil {
+	if err := fl.s.db.Order("id ASC").Find(&likes, "rkey > ?", fl.lastLoad).Error; err != nil {
 		return err
 	}
 
 	for i := 0; i < len(likes); i++ {
-		fl.addLikeUnlock(likes[i])
+		fl.addLikeToBuffer(likes[i])
 	}
+
+	fl.fanoutLikes(context.TODO(), likes)
 
 	if len(likes) > 0 {
 		fl.lastLoad = likes[len(likes)-1].Rkey
@@ -82,12 +94,50 @@ func (fl *FollowLikes) refreshLikes() error {
 	return nil
 }
 
+func (f *FollowLikes) janitor() {
+	ticker := time.Tick(time.Minute * 5)
+	for range ticker {
+		f.cleanupOfflineUsers()
+	}
+}
+
+func (f *FollowLikes) cleanupOfflineUsers() {
+	f.lulk.Lock()
+	defer f.lulk.Unlock()
+
+	now := time.Now()
+	for u, cache := range f.liveUsers {
+		if now.Sub(cache.lastAccess) > time.Hour*6 {
+			delete(f.liveUsers, u)
+		}
+	}
+	fanoutCachedUsers.Set(float64(len(f.liveUsers)))
+}
+
+func (f *FollowLikes) fanoutLikes(ctx context.Context, likes []*FeedLike) {
+	f.lulk.Lock()
+	defer f.lulk.Unlock()
+
+	for u, cache := range f.liveUsers {
+		follows, err := f.getFollows(ctx, u)
+		if err != nil {
+			log.Errorw("failed to get follows during fanout", "user", u, "err", err)
+			continue
+		}
+
+		cache.updateLikes(likes, follows)
+	}
+}
+
 type likeChunk struct {
 	lk    sync.Mutex
 	likes []*FeedLike
 }
 
-func (f *FollowLikes) addLikeUnlock(like *FeedLike) {
+func (f *FollowLikes) addLikeToBuffer(like *FeedLike) {
+	f.lk.Lock()
+	defer f.lk.Unlock()
+
 	if len(f.chunks) == 0 {
 		f.chunks = append(f.chunks, &likeChunk{})
 	}
@@ -99,13 +149,15 @@ func (f *FollowLikes) addLikeUnlock(like *FeedLike) {
 		last = next
 
 		// maybe rotate the buffer forward
-		earliestLike := f.chunks[0].likes[0]
-		thresh := TID(time.Now().Add(time.Hour * -24))
-		if earliestLike.Rkey < thresh {
+		thresh := TID(time.Now().Add(time.Hour * -25))
+		for len(f.chunks[0].likes) > 0 {
+			earliestLike := f.chunks[0].likes[0]
+			if earliestLike.Rkey > thresh {
+				break
+			}
 			f.chunks = f.chunks[1:]
 		}
 	}
-
 	last.append(like)
 }
 
@@ -143,11 +195,6 @@ func (f *FollowLikes) Description() string {
 	return "posts that people you follow like"
 }
 
-type flPosts struct {
-	posts []likeCount
-	EOL   time.Time
-}
-
 type likeCount struct {
 	Ref uint
 	Cnt int
@@ -172,8 +219,8 @@ type followCache struct {
 	eol  time.Time
 }
 
-func (f *FollowLikes) getFollows(ctx context.Context, u *User) (map[uint]struct{}, error) {
-	fol, ok := f.followCache.Get(u.ID)
+func (f *FollowLikes) getFollows(ctx context.Context, uid uint) (map[uint]struct{}, error) {
+	fol, ok := f.followCache.Get(uid)
 	if ok {
 		fc := fol.(*followCache)
 		if time.Now().Before(fc.eol) {
@@ -182,7 +229,7 @@ func (f *FollowLikes) getFollows(ctx context.Context, u *User) (map[uint]struct{
 	}
 
 	var follows []Follow
-	if err := f.s.db.Find(&follows, "uid = ?", u.ID).Error; err != nil {
+	if err := f.s.db.Find(&follows, "uid = ?", uid).Error; err != nil {
 		return nil, err
 	}
 
@@ -191,7 +238,7 @@ func (f *FollowLikes) getFollows(ctx context.Context, u *User) (map[uint]struct{
 		fm[f.Following] = struct{}{}
 	}
 
-	f.followCache.Add(u.ID, &followCache{
+	f.followCache.Add(uid, &followCache{
 		fmap: fm,
 		eol:  time.Now().Add(time.Minute * 15),
 	})
@@ -199,14 +246,74 @@ func (f *FollowLikes) getFollows(ctx context.Context, u *User) (map[uint]struct{
 	return fm, nil
 }
 
-func (f *FollowLikes) GetFeed(ctx context.Context, u *User, lim int, curs *string) (*bsky.FeedGetFeedSkeleton_Output, error) {
-	if !u.HasFollowsScraped() {
-		if err := f.s.scrapeFollowsForUser(ctx, u); err != nil {
+type liveUserCache struct {
+	lk         sync.Mutex
+	postCounts map[uint]int
+	lastAccess time.Time
+}
+
+func (luc *liveUserCache) updateLikes(likes []*FeedLike, follows map[uint]struct{}) {
+	luc.lk.Lock()
+	defer luc.lk.Unlock()
+
+	for _, lk := range likes {
+		if _, ok := follows[lk.Uid]; ok {
+			luc.postCounts[lk.Ref]++
+		}
+	}
+}
+
+func (f *FollowLikes) getLikedPostsAboveThreshold(ctx context.Context, u *User, thresh int) ([]uint, error) {
+	f.lulk.Lock()
+	v, ok := f.liveUsers[u.ID]
+	if !ok {
+		v = &liveUserCache{}
+		f.liveUsers[u.ID] = v
+		fanoutCachedUsers.Set(float64(len(f.liveUsers)))
+	}
+	f.lulk.Unlock()
+
+	v.lk.Lock()
+	defer v.lk.Unlock()
+
+	if v.postCounts == nil {
+		follows, err := f.getFollows(ctx, u.ID)
+		if err != nil {
 			return nil, err
+		}
+
+		posts := make(map[uint]int)
+		if err := f.walkRecentLikes(ctx, func(l *FeedLike) error {
+			_, ok := follows[l.Uid]
+			if ok {
+				posts[l.Ref]++
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+
+		v.postCounts = posts
+	}
+
+	var out []uint
+	for k, c := range v.postCounts {
+		if c >= thresh {
+			out = append(out, k)
 		}
 	}
 
-	fmap, err := f.getFollows(ctx, u)
+	v.lastAccess = time.Now()
+
+	sort.Slice(out, func(i, j int) bool {
+		return out[i] > out[j]
+	})
+
+	return out, nil
+}
+
+func (f *FollowLikes) getLikedPostsFallback(ctx context.Context, u *User) ([]uint, error) {
+	fmap, err := f.getFollows(ctx, u.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -233,6 +340,20 @@ func (f *FollowLikes) GetFeed(ctx context.Context, u *User, lim int, curs *strin
 		return postids[i] > postids[j]
 	})
 
+	return postids, nil
+}
+func (f *FollowLikes) GetFeed(ctx context.Context, u *User, lim int, curs *string) (*bsky.FeedGetFeedSkeleton_Output, error) {
+	if !u.HasFollowsScraped() {
+		if err := f.s.scrapeFollowsForUser(ctx, u); err != nil {
+			return nil, err
+		}
+	}
+
+	postids, err := f.getLikedPostsAboveThreshold(ctx, u, 3)
+	if err != nil {
+		return nil, err
+	}
+
 	var start int
 	if curs != nil {
 		n, err := strconv.Atoi(*curs)
@@ -253,7 +374,7 @@ func (f *FollowLikes) GetFeed(ctx context.Context, u *User, lim int, curs *strin
 	}
 
 	var fposts []PostRef
-	if err := f.s.db.Find(&fposts, "id in (?)", postids).Error; err != nil {
+	if err := f.s.db.Debug().Find(&fposts, "id in (?)", postids).Error; err != nil {
 		return nil, err
 	}
 
