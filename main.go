@@ -156,6 +156,8 @@ var runCmd = &cli.Command{
 	},
 	Action: func(cctx *cli.Context) error {
 
+		//logging.SetLogLevel("*", "INFO")
+
 		log.Info("Connecting to database")
 		db, err := cliutil.SetupDatabase(cctx.String("database-url"), 40)
 		if err != nil {
@@ -310,6 +312,11 @@ var runCmd = &cli.Command{
 
 		devfeeduri := "at://" + middlebit + "devfeed"
 		s.AddFeedBuilder(devfeeduri, &DevFeed{
+			s: s,
+		})
+
+		infpostsuri := "at://" + middlebit + "infreq"
+		s.AddFeedBuilder(infpostsuri, &InfrequentPosters{
 			s: s,
 		})
 

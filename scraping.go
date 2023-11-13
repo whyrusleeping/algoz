@@ -54,6 +54,7 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 
 			if evt.TooBig {
+				return nil
 				if err := s.processTooBigCommit(ctx, evt); err != nil {
 					log.Errorf("failed to process tooBig event: %s", err)
 					return nil
@@ -129,7 +130,6 @@ func (s *Server) Run(ctx context.Context) error {
 		sched := autoscaling.NewScheduler(autoscaling.DefaultAutoscaleSettings(), "", handleFunc)
 		if err := events.HandleRepoStream(ctx, con, sched); err != nil {
 			log.Errorf("stream processing error: %s", err)
-
 		}
 	}
 }
@@ -137,7 +137,7 @@ func (s *Server) Run(ctx context.Context) error {
 // handleOp receives every incoming repo event and is where indexing logic lives
 func (s *Server) handleOp(ctx context.Context, op repomgr.EventKind, seq int64, path string, did string, rcid *cid.Cid, rec any) error {
 	if op == repomgr.EvtKindCreateRecord || op == repomgr.EvtKindUpdateRecord {
-		log.Debugf("handling event(%d): %s - %s", seq, did, path)
+		log.Infof("handling event(%d): %s - %s", seq, did, path)
 		u, err := s.getOrCreateUser(ctx, did)
 		if err != nil {
 			return fmt.Errorf("checking user: %w", err)
@@ -210,7 +210,15 @@ func (s *Server) handleOp(ctx context.Context, op repomgr.EventKind, seq int64, 
 }
 
 func (s *Server) processTooBigCommit(ctx context.Context, evt *comatproto.SyncSubscribeRepos_Commit) error {
-	repodata, err := comatproto.SyncGetRepo(ctx, s.bgsxrpc, evt.Repo, "", evt.Commit.String())
+	/*
+		// TODO: use the since value, cant do it right now because we dont have an easy method to walk partial MST trees
+		since := ""
+		if evt.Since != nil {
+			since = *evt.Since
+		}
+	*/
+
+	repodata, err := comatproto.SyncGetRepo(ctx, s.bgsxrpc, evt.Repo, "")
 	if err != nil {
 		return err
 	}
@@ -282,10 +290,47 @@ func (s *Server) getOrCreateUser(ctx context.Context, did string) (*User, error)
 }
 
 func (s *Server) handleFromDid(ctx context.Context, did string) (string, error) {
-	handle, _, err := api.ResolveDidToHandle(ctx, s.xrpcc, s.didr, &api.ProdHandleResolver{}, did)
+	handle, _, err := api.ResolveDidToHandle(ctx, s.didr, &api.ProdHandleResolver{}, did)
 	if err != nil {
 		return "", err
 	}
 
 	return handle, nil
+}
+
+func (s *Server) Cleanup(epoch time.Time) error {
+	if err := s.db.Exec("delete from post_texts where created_at < ?", epoch).Error; err != nil {
+		return err
+	}
+
+	if err := s.db.Exec("delete from feed_likes where rkey < ?", TID(epoch)).Error; err != nil {
+		return err
+	}
+
+	if err := s.db.Exec("delete from post_refs where created_at < ?", epoch).Error; err != nil {
+		return err
+	}
+
+	if err := s.db.Exec("delete from feed_reposts where rkey < ?", TID(epoch)).Error; err != nil {
+		return err
+	}
+
+	if err := s.db.Exec("delete from feed_incls where created_at < ?", epoch).Error; err != nil {
+		return err
+	}
+
+	if err := s.db.Exec("vacuum", epoch).Error; err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Server) CleanupRoutine() {
+	oneMonth := time.Hour * 24 * 30
+	for range time.Tick(time.Hour) {
+		if err := s.Cleanup(time.Now().Add(-1 * oneMonth)); err != nil {
+			log.Errorf("cleanup failed: %s", err)
+		}
+	}
 }
