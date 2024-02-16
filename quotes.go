@@ -23,7 +23,7 @@ func (f *QuotePostsFeed) Description() string {
 }
 
 func (f *QuotePostsFeed) GetFeed(ctx context.Context, u *User, lim int, cursor *string) (*bsky.FeedGetFeedSkeleton_Output, error) {
-	skel, curs, err := f.s.getFeed(ctx, "allqps", lim, cursor)
+	skel, curs, err := f.s.getFeed(ctx, "allqps", lim, cursor, nil)
 	if err != nil {
 		return nil, err
 	}

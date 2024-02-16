@@ -26,7 +26,7 @@ func (f *AllPicsFeed) Description() string {
 }
 
 func (f *AllPicsFeed) GetFeed(ctx context.Context, u *User, lim int, cursor *string) (*bsky.FeedGetFeedSkeleton_Output, error) {
-	skel, curs, err := f.s.getFeed(ctx, "allpics", lim, cursor)
+	skel, curs, err := f.s.getFeed(ctx, "allpics", lim, cursor, nil)
 	if err != nil {
 		return nil, err
 	}

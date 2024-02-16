@@ -21,7 +21,7 @@ import (
 	. "github.com/whyrusleeping/algoz/models"
 )
 
-func (s *Server) getLastCursor() (int64, error) {
+func (s *Server) loadCursor() (int64, error) {
 	var lastSeq LastSeq
 	if err := s.db.Find(&lastSeq).Error; err != nil {
 		return 0, err
@@ -34,15 +34,36 @@ func (s *Server) getLastCursor() (int64, error) {
 	return lastSeq.Seq, nil
 }
 
+func (s *Server) getCursor() int64 {
+	s.cursorLk.Lock()
+	defer s.cursorLk.Unlock()
+	return s.cursor
+}
+
 func (s *Server) updateLastCursor(curs int64) error {
-	return s.db.Model(LastSeq{}).Where("id = 1").Update("seq", curs).Error
+	s.cursorLk.Lock()
+	if curs < s.cursor {
+		s.cursorLk.Unlock()
+		return nil
+	}
+	s.cursor = curs
+	s.cursorLk.Unlock()
+
+	if curs%200 == 0 {
+		if err := s.db.Model(LastSeq{}).Where("id = 1").Update("seq", curs).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	cur, err := s.getLastCursor()
+	loadedCursor, err := s.loadCursor()
 	if err != nil {
 		return fmt.Errorf("get last cursor: %w", err)
 	}
+
+	s.cursor = loadedCursor
 
 	handleFunc := func(ctx context.Context, xe *events.XRPCStreamEvent) error {
 		switch {
@@ -113,7 +134,7 @@ func (s *Server) Run(ctx context.Context) error {
 	var backoff time.Duration
 	for {
 		d := websocket.DefaultDialer
-		con, _, err := d.Dial(fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos?cursor=%d", s.bgshost, cur), http.Header{})
+		con, _, err := d.Dial(fmt.Sprintf("%s/xrpc/com.atproto.sync.subscribeRepos?cursor=%d", s.bgshost, s.getCursor()), http.Header{})
 		if err != nil {
 			log.Errorf("failed to dial: %s", err)
 			time.Sleep(backoff)
@@ -127,7 +148,10 @@ func (s *Server) Run(ctx context.Context) error {
 
 		backoff = 0
 
-		sched := autoscaling.NewScheduler(autoscaling.DefaultAutoscaleSettings(), "", handleFunc)
+		opts := autoscaling.DefaultAutoscaleSettings()
+		opts.Concurrency = 20
+		opts.MaxConcurrency = 100
+		sched := autoscaling.NewScheduler(opts, "", handleFunc)
 		if err := events.HandleRepoStream(ctx, con, sched); err != nil {
 			log.Errorf("stream processing error: %s", err)
 		}
@@ -136,6 +160,11 @@ func (s *Server) Run(ctx context.Context) error {
 
 // handleOp receives every incoming repo event and is where indexing logic lives
 func (s *Server) handleOp(ctx context.Context, op repomgr.EventKind, seq int64, path string, did string, rcid *cid.Cid, rec any) error {
+	col := strings.Split(path, "/")[0]
+	start := time.Now()
+	defer func() {
+		handleOpHist.WithLabelValues(string(op), col).Observe(float64(time.Since(start).Milliseconds()))
+	}()
 	if op == repomgr.EvtKindCreateRecord || op == repomgr.EvtKindUpdateRecord {
 		log.Infof("handling event(%d): %s - %s", seq, did, path)
 		u, err := s.getOrCreateUser(ctx, did)
@@ -199,11 +228,8 @@ func (s *Server) handleOp(ctx context.Context, op repomgr.EventKind, seq int64, 
 		}
 	}
 
-	if seq%200 == 0 {
-		log.Infof("updating cursor: %d", seq)
-		if err := s.updateLastCursor(seq); err != nil {
-			log.Error("Failed to update cursor: ", err)
-		}
+	if err := s.updateLastCursor(seq); err != nil {
+		log.Error("Failed to update cursor: ", err)
 	}
 
 	return nil
@@ -271,12 +297,14 @@ func (s *Server) getOrCreateUser(ctx context.Context, did string) (*User, error)
 	}
 	if u.ID == 0 {
 		// TODO: figure out peoples handles
-		h, err := s.handleFromDid(ctx, did)
-		if err != nil {
-			log.Errorw("failed to resolve did to handle", "did", did, "err", err)
-		} else {
-			u.Handle = h
-		}
+		/*
+			h, err := s.handleFromDid(ctx, did)
+			if err != nil {
+				log.Errorw("failed to resolve did to handle", "did", did, "err", err)
+			} else {
+				u.Handle = h
+			}
+		*/
 
 		u.Did = did
 		if err := s.db.Create(&u).Error; err != nil {

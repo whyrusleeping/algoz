@@ -7,13 +7,15 @@ import (
 	"github.com/bluesky-social/indigo/api/atproto"
 	bsky "github.com/bluesky-social/indigo/api/bsky"
 	"github.com/bluesky-social/indigo/xrpc"
+	lru "github.com/hashicorp/golang-lru"
 	. "github.com/whyrusleeping/algoz/models"
 	"gorm.io/gorm"
 )
 
 type ImageLabeler struct {
-	ic *ImageClassifier
-	db *gorm.DB
+	fetcher *ImageFetcher
+	ic      *ImageClassifier
+	db      *gorm.DB
 
 	xrpcc *xrpc.Client
 
@@ -22,13 +24,14 @@ type ImageLabeler struct {
 
 type AddLabelFunc func(context.Context, string, *PostRef) error
 
-func NewImageLabeler(classifierHost string, db *gorm.DB, xrpcc *xrpc.Client, addlabel AddLabelFunc) *ImageLabeler {
+func NewImageLabeler(classifierHost string, db *gorm.DB, xrpcc *xrpc.Client, fetcher *ImageFetcher, addlabel AddLabelFunc) *ImageLabeler {
 	ic := &ImageClassifier{
 		Host:       classifierHost,
 		Categories: []string{"cat", "dog", "mammal", "bird", "clothed person", "cloud", "sky", "flower", "sea creature", "bird", "text post"},
 	}
 
 	return &ImageLabeler{
+		fetcher:  fetcher,
 		ic:       ic,
 		db:       db,
 		xrpcc:    xrpcc,
@@ -83,4 +86,36 @@ func (il *ImageLabeler) HandleLike(context.Context, *User, *bsky.FeedPost) error
 
 func (il *ImageLabeler) HandleRepost(context.Context, *User, *PostRef, string) error {
 	return nil
+}
+
+type ImageFetcher struct {
+	xrpcc *xrpc.Client
+
+	cache *lru.Cache
+}
+
+func NewImageFetcher(xrpcc *xrpc.Client) *ImageFetcher {
+	c, _ := lru.New(2000)
+
+	return &ImageFetcher{
+		xrpcc: xrpcc,
+		cache: c,
+	}
+}
+
+func (i *ImageFetcher) Fetch(ctx context.Context, did string, img *bsky.EmbedImages_Image) ([]byte, error) {
+	cachekey := did + img.Image.Ref.String()
+
+	val, ok := i.cache.Get(cachekey)
+	if ok {
+		return val.([]byte), nil
+	}
+
+	blob, err := atproto.SyncGetBlob(ctx, i.xrpcc, img.Image.Ref.String(), did)
+	if err != nil {
+		return nil, err
+	}
+
+	i.cache.Add(cachekey, blob)
+	return blob, nil
 }

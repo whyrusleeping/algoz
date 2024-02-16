@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +28,9 @@ import (
 	logging "github.com/ipfs/go-log"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/whyrusleeping/algoz/models"
 	. "github.com/whyrusleeping/algoz/models"
 	"gitlab.com/yawning/secp256k1-voi/secec"
@@ -37,6 +43,21 @@ import (
 	gorm "gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+var feedRequestsHist = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "feed_request_durations",
+	Buckets: prometheus.ExponentialBuckets(1, 2, 15),
+}, []string{"feed"})
+
+var handleOpHist = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "handle_op_duration",
+	Help:    "A histogram of op handling durations",
+	Buckets: prometheus.ExponentialBuckets(1, 2, 15),
+}, []string{"op", "collection"})
+
+var firehoseSeqGauge = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "algoz_firehose_seq",
+})
 
 //type User = models.User
 //type PostRef = models.PostRef
@@ -108,6 +129,12 @@ type Server struct {
 	userLk    sync.Mutex
 	userCache *lru.Cache
 	keyCache  *lru.Cache
+
+	Maintenance        bool
+	MaintenancePostUri string
+
+	cursor   int64
+	cursorLk sync.Mutex
 }
 
 type feedSpec struct {
@@ -150,8 +177,14 @@ var runCmd = &cli.Command{
 		&cli.BoolFlag{
 			Name: "no-index",
 		},
+		&cli.BoolFlag{
+			Name: "maintenance",
+		},
 		&cli.StringFlag{
 			Name: "img-class-host",
+		},
+		&cli.StringFlag{
+			Name: "qualitea-class-host",
 		},
 	},
 	Action: func(cctx *cli.Context) error {
@@ -217,14 +250,16 @@ var runCmd = &cli.Command{
 		ucache, _ := lru.New(100000)
 		kcache, _ := lru.New(100000)
 		s := &Server{
-			db:        db,
-			bgshost:   cctx.String("atp-bgs-host"),
-			xrpcc:     xc,
-			bgsxrpc:   bgsxrpc,
-			didr:      didr,
-			userCache: ucache,
-			keyCache:  kcache,
-			fbm:       make(map[string]FeedBuilder),
+			db:                 db,
+			bgshost:            cctx.String("atp-bgs-host"),
+			xrpcc:              xc,
+			bgsxrpc:            bgsxrpc,
+			didr:               didr,
+			userCache:          ucache,
+			keyCache:           kcache,
+			fbm:                make(map[string]FeedBuilder),
+			Maintenance:        cctx.Bool("maintenance"),
+			MaintenancePostUri: "at://did:plc:vpkhqolt662uhesyj6nxm7ys/app.bsky.feed.post/3kkcyoihzlk2b",
 		}
 
 		if d := cctx.String("did-doc"); d != "" {
@@ -234,6 +269,11 @@ var runCmd = &cli.Command{
 			}
 
 			s.didDoc = doc
+		}
+
+		noindex := cctx.Bool("no-index")
+		if s.Maintenance {
+			noindex = true
 		}
 
 		mydid := "did:plc:vpkhqolt662uhesyj6nxm7ys"
@@ -281,6 +321,11 @@ var runCmd = &cli.Command{
 				Description: "pictures of the flowers (potentially nsfw)",
 				Uri:         "at://" + middlebit + "flowers",
 			},
+			{
+				Name:        "qualitea",
+				Description: "some weird ML classifier",
+				Uri:         "at://" + middlebit + "qualitea",
+			},
 		}
 
 		allpicsuri := "at://" + middlebit + "allpics"
@@ -315,15 +360,21 @@ var runCmd = &cli.Command{
 			s: s,
 		})
 
-		infpostsuri := "at://" + middlebit + "infreq"
-		s.AddFeedBuilder(infpostsuri, &InfrequentPosters{
+		infeed := &InfrequentPosters{
 			s: s,
-		})
+		}
+		infpostsuri := "at://" + middlebit + "infreq"
+		s.AddFeedBuilder(infpostsuri, infeed)
+
+		go infeed.upkeep()
 
 		folikeuri := "at://" + middlebit + "followlikes"
 		s.AddFeedBuilder(folikeuri, NewFollowLikes(s))
 
-		s.AddProcessor(NewImageLabeler(cctx.String("img-class-host"), s.db, s.xrpcc, s.addPostToFeed))
+		fetcher := NewImageFetcher(s.xrpcc)
+
+		s.AddProcessor(NewImageLabeler(cctx.String("img-class-host"), s.db, s.xrpcc, fetcher, s.addPostToFeed))
+		//s.AddProcessor(NewGoodPostFinder(cctx.String("qualitea-class-host"), fetcher, s.addPostToFeed))
 
 		for _, f := range s.feeds {
 			if err := s.db.Create(&models.Feed{
@@ -358,7 +409,12 @@ var runCmd = &cli.Command{
 			}
 		}()
 
-		if cctx.Bool("no-index") {
+		go func() {
+			http.Handle("/metrics", promhttp.Handler())
+			http.ListenAndServe(":5252", nil)
+		}()
+
+		if noindex {
 			select {}
 		}
 
@@ -467,7 +523,21 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 	ctx, span := otel.Tracer("algoz").Start(e.Request().Context(), "handleGetFeedSkeleton")
 	defer span.End()
 
+	if s.Maintenance {
+		return e.JSON(200, &bsky.FeedGetFeedSkeleton_Output{
+			Feed: []*bsky.FeedDefs_SkeletonFeedPost{
+				{Post: s.MaintenancePostUri},
+			},
+		})
+
+	}
+
 	feed := e.QueryParam("feed")
+
+	start := time.Now()
+	defer func() {
+		feedRequestsHist.WithLabelValues(feed).Observe(float64(time.Since(start).Milliseconds()))
+	}()
 
 	span.SetAttributes(attribute.String("feed", feed))
 
@@ -530,9 +600,31 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 	}
 
 	switch puri.Rkey {
-	case "coolstuff", "cats", "dogs", "nsfw", "seacreatures", "flowers":
+	case "coolstuff", "cats", "dogs", "nsfw", "seacreatures", "flowers", "sports":
 		// all of these feeds are fed by the same 'feed_incls' table
-		feed, outcurs, err := s.getFeed(ctx, puri.Rkey, limit, cursor)
+		feed, outcurs, err := s.getFeed(ctx, puri.Rkey, limit, cursor, nil)
+		if err != nil {
+			return err
+		}
+
+		return e.JSON(200, &bsky.FeedGetFeedSkeleton_Output{
+			Feed:   feed,
+			Cursor: outcurs,
+		})
+	case "topic-art", "topic-gaming", "topic-animals", "topic-dev", "topic-bluesky", "topic-science":
+		// all of these feeds are fed by the same 'feed_incls' table
+		feed, outcurs, err := s.getTopicFeed(ctx, puri.Rkey, limit, cursor)
+		if err != nil {
+			return err
+		}
+
+		return e.JSON(200, &bsky.FeedGetFeedSkeleton_Output{
+			Feed:   feed,
+			Cursor: outcurs,
+		})
+	case "qualitea":
+		//lt := 1
+		feed, outcurs, err := s.getFeed(ctx, puri.Rkey, limit, cursor, nil)
 		if err != nil {
 			return err
 		}
@@ -870,7 +962,7 @@ func (s *Server) getFeedAddOrder(ctx context.Context, feed string, limit int, cu
 	return skelposts, &outcurs, nil
 }
 
-func (s *Server) getFeed(ctx context.Context, feed string, limit int, cursor *string) ([]*bsky.FeedDefs_SkeletonFeedPost, *string, error) {
+func (s *Server) getFeed(ctx context.Context, feed string, limit int, cursor *string, likethresh *int) ([]*bsky.FeedDefs_SkeletonFeedPost, *string, error) {
 	ctx, span := otel.Tracer("algoz").Start(ctx, "getFeed")
 	defer span.End()
 
@@ -889,6 +981,9 @@ func (s *Server) getFeed(ctx context.Context, feed string, limit int, cursor *st
 
 		q = q.Where("post_refs.created_at < ?", t)
 	}
+	if likethresh != nil {
+		q = q.Where("post_refs.likes > ?", *likethresh)
+	}
 	if err := q.Find(&posts).Error; err != nil {
 		return nil, nil, err
 	}
@@ -903,6 +998,116 @@ func (s *Server) getFeed(ctx context.Context, feed string, limit int, cursor *st
 	}
 
 	outcurs := posts[len(posts)-1].CreatedAt.Format(time.RFC3339)
+
+	return skelposts, &outcurs, nil
+}
+
+type topicFeedCursor struct {
+	Offset int
+}
+
+func (tfc *topicFeedCursor) ToString() string {
+	b, err := json.Marshal(tfc)
+	if err != nil {
+		panic(err)
+	}
+
+	return string(b)
+}
+
+func parseCursor(s string) (*topicFeedCursor, error) {
+	var out topicFeedCursor
+	if err := json.Unmarshal([]byte(s), &out); err != nil {
+		return nil, err
+	}
+
+	return &out, nil
+}
+
+func hotnessForPost(p PostRef) float64 {
+	num := float64(p.Likes + p.ThreadSize)
+
+	age := time.Since(p.CreatedAt)
+
+	denom := math.Pow(age.Hours()+2, 2.5)
+
+	return num / denom
+}
+
+func hotnessSort(posts []PostRef) {
+	scores := make(map[uint]float64, len(posts))
+
+	for _, p := range posts {
+		scores[p.ID] = hotnessForPost(p)
+	}
+
+	sort.Slice(posts, func(i, j int) bool {
+		return scores[posts[i].ID] > scores[posts[j].ID]
+	})
+}
+
+type topicPostsCache struct {
+	cachedAt time.Time
+	posts    []PostRef
+}
+
+func (s *Server) getTopicFeed(ctx context.Context, feed string, limit int, cursor *string) ([]*bsky.FeedDefs_SkeletonFeedPost, *string, error) {
+	var curs *topicFeedCursor
+	if cursor != nil {
+		c, err := parseCursor(*cursor)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid cursor: %w", err)
+		}
+
+		curs = c
+	} else {
+		curs = &topicFeedCursor{
+			Offset: 0,
+		}
+	}
+
+	log.Infof("serving topic %s", feed)
+	f, err := s.getFeedRef(ctx, feed)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	newest := time.Now()
+	oldest := newest.Add(time.Hour * -24)
+
+	// get all posts in the last 24 hours
+	var posts []PostRef
+	q := s.db.Raw(`WITH mytopic AS (SELECT * FROM feed_incls WHERE feed = ? AND created_at > ? AND created_at < ?)
+	SELECT post_refs.* from mytopic LEFT JOIN post_refs on post_refs.id = mytopic.post`, f.ID, oldest, newest)
+	if err := q.Scan(&posts).Error; err != nil {
+		return nil, nil, err
+	}
+
+	hotnessSort(posts)
+
+	if curs.Offset > len(posts) {
+		return []*bsky.FeedDefs_SkeletonFeedPost{}, cursor, nil
+	}
+	posts = posts[curs.Offset:]
+
+	if limit > len(posts) {
+		limit = len(posts)
+	}
+
+	posts = posts[:limit]
+
+	curs.Offset += len(posts)
+
+	skelposts, err := s.postsToFeed(ctx, posts)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if len(skelposts) == 0 {
+		return []*bsky.FeedDefs_SkeletonFeedPost{}, nil, nil
+	}
+
+	outcurs := curs.ToString()
 
 	return skelposts, &outcurs, nil
 }
@@ -1056,7 +1261,7 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 	// Update columns to default value on `id` conflict
 	if err := s.db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "uid"}, {Name: "rkey"}},
-		DoUpdates: clause.Assignments(map[string]interface{}{"cid": "not_found"}),
+		DoUpdates: clause.AssignmentColumns([]string{"cid", "not_found"}),
 	}).Create(pref).Error; err != nil {
 		return err
 	}
@@ -1078,7 +1283,7 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 
 	for _, fb := range s.processors {
 		if err := fb.HandlePost(ctx, u, pref, rec); err != nil {
-			return err
+			log.Errorf("handle post failed: %s", err)
 		}
 	}
 
@@ -1088,12 +1293,14 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 		}
 	}
 
-	if err := s.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&PostText{
-		Post: pref.ID,
-		Text: rec.Text,
-	}).Error; err != nil {
-		return err
-	}
+	/*
+		if err := s.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&PostText{
+			Post: pref.ID,
+			Text: rec.Text,
+		}).Error; err != nil {
+			return err
+		}
+	*/
 
 	return nil
 }

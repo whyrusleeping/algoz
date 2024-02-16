@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -31,6 +32,40 @@ func (f *InfrequentPosters) upkeep() {
 	}
 }
 
+type infreqCursor struct {
+	C time.Time
+	T int
+}
+
+func parseInfreqCursor(cursor string) (*infreqCursor, error) {
+	if len(cursor) < 2 {
+		return nil, fmt.Errorf("invalid cursor")
+	}
+	if cursor[0] == '{' {
+		var c infreqCursor
+		if err := json.Unmarshal([]byte(cursor), &c); err != nil {
+			return nil, err
+		}
+
+		return &c, nil
+	}
+
+	t, err := time.Parse(time.RFC3339, cursor)
+	if err != nil {
+		return nil, err
+	}
+
+	return &infreqCursor{C: t, T: 10}, nil
+}
+
+func (ifc *infreqCursor) ToString() string {
+	b, err := json.Marshal(ifc)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
 func (f *InfrequentPosters) GetFeed(ctx context.Context, u *User, limit int, cursor *string) (*bsky.FeedGetFeedSkeleton_Output, error) {
 	if !u.HasFollowsScraped() {
 		if err := f.s.scrapeFollowsForUser(ctx, u); err != nil {
@@ -40,39 +75,54 @@ func (f *InfrequentPosters) GetFeed(ctx context.Context, u *User, limit int, cur
 
 	oldest := time.Now().Add(time.Hour * -24)
 
-	params := []any{u.ID, oldest, limit}
+	params := []any{u.ID, 10, oldest, limit}
 	var extra string
+	var curs *infreqCursor
 	if cursor != nil {
-		t, err := time.Parse(time.RFC3339, *cursor)
+		c, err := parseInfreqCursor(*cursor)
 		if err != nil {
 			return nil, err
 		}
 
-		oldest = t.Add(time.Hour * -24)
+		curs = c
+
+		oldest = c.C.Add(time.Hour * -24)
 
 		extra = "AND post_refs.created_at < ?"
-		params = []any{u.ID, oldest, t, limit}
+		params = []any{u.ID, c.T, oldest, c.C, limit}
+	} else {
+		curs = &infreqCursor{T: 10}
 	}
 
-	qs := fmt.Sprintf(`WITH inf_follows AS (
-		SELECT follows.* FROM follows
-		LEFT JOIN usr_post_counts ON 
-			follows.uid = ? AND
-			follows.following = usr_post_counts.uid
-		WHERE usr_post_counts.count < 10
-	)
-	SELECT post_refs.* 
-	FROM "post_refs"
-	INNER JOIN inf_follows ON inf_follows.following = post_refs.uid
-	WHERE post_refs.created_at > ?
-	%s
-	ORDER BY post_refs.created_at DESC 
-	LIMIT ?;`, extra)
+	qs := fmt.Sprintf(`SELECT * FROM post_refs
+		WHERE post_refs.uid IN (SELECT following
+		    FROM follows
+		    WHERE uid = ?
+		    AND following IN (
+		        SELECT uid FROM usr_post_counts WHERE count < ? AND count > 0
+		    ))
+			AND post_refs.created_at > ?
+			%s
+		ORDER BY post_refs.created_at DESC
+		LIMIT ?;`, extra)
 
 	var out []PostRef
-	q := f.s.db.Debug().Raw(qs, params...)
+	q := f.s.db.Raw(qs, params...)
 	if err := q.Find(&out).Error; err != nil {
 		return nil, err
+	}
+
+	// first request, not many results back
+	if cursor == nil && len(out) < 20 {
+		curs.T = 20
+
+		params[1] = 20
+
+		var out []PostRef
+		q := f.s.db.Raw(qs, params...)
+		if err := q.Find(&out).Error; err != nil {
+			return nil, err
+		}
 	}
 
 	skelposts, err := f.s.postsToFeed(ctx, out)
@@ -80,14 +130,14 @@ func (f *InfrequentPosters) GetFeed(ctx context.Context, u *User, limit int, cur
 		return nil, err
 	}
 
-	var outcurs *string
 	if len(out) > 0 {
-		oc := out[len(out)-1].CreatedAt.Format(time.RFC3339)
-		outcurs = &oc
+		curs.C = out[len(out)-1].CreatedAt
 	}
 
+	outcurs := curs.ToString()
+
 	return &bsky.FeedGetFeedSkeleton_Output{
-		Cursor: outcurs,
+		Cursor: &outcurs,
 		Feed:   skelposts,
 	}, nil
 }
