@@ -23,6 +23,10 @@ func (f *InfrequentPosters) Description() string {
 }
 
 func (f *InfrequentPosters) upkeep() {
+	if f.s.db == nil {
+		log.Errorf("maintenance mode")
+		return
+	}
 	for {
 		if err := f.s.db.Exec("REFRESH MATERIALIZED VIEW CONCURRENTLY usr_post_counts").Error; err != nil {
 			log.Errorf("failed to refresh view: %s", err)

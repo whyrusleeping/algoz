@@ -190,25 +190,31 @@ var runCmd = &cli.Command{
 	Action: func(cctx *cli.Context) error {
 
 		//logging.SetLogLevel("*", "INFO")
+		maintenance := cctx.Bool("maintenance")
 
 		log.Info("Connecting to database")
-		db, err := cliutil.SetupDatabase(cctx.String("database-url"), 40)
-		if err != nil {
-			return err
-		}
+		var db *gorm.DB
 
-		log.Info("Migrating database")
-		db.AutoMigrate(&models.User{})
-		db.AutoMigrate(&models.Follow{})
-		db.AutoMigrate(&LastSeq{})
-		db.AutoMigrate(&models.PostRef{})
-		db.AutoMigrate(&models.FeedIncl{})
-		db.AutoMigrate(&models.Feed{})
-		db.AutoMigrate(&models.FeedLike{})
-		db.AutoMigrate(&models.FeedRepost{})
-		db.AutoMigrate(&models.Block{})
-		db.AutoMigrate(&UserAssoc{})
-		db.AutoMigrate(&PostText{})
+		if !maintenance {
+			adb, err := cliutil.SetupDatabase(cctx.String("database-url"), 40)
+			if err != nil {
+				return err
+			}
+			db = adb
+
+			log.Info("Migrating database")
+			db.AutoMigrate(&models.User{})
+			db.AutoMigrate(&models.Follow{})
+			db.AutoMigrate(&LastSeq{})
+			db.AutoMigrate(&models.PostRef{})
+			db.AutoMigrate(&models.FeedIncl{})
+			db.AutoMigrate(&models.Feed{})
+			db.AutoMigrate(&models.FeedLike{})
+			db.AutoMigrate(&models.FeedRepost{})
+			db.AutoMigrate(&models.Block{})
+			db.AutoMigrate(&UserAssoc{})
+			db.AutoMigrate(&PostText{})
+		}
 
 		log.Infof("Configuring HTTP server")
 		e := echo.New()
@@ -382,12 +388,14 @@ var runCmd = &cli.Command{
 		mixtopicsuri := "at://" + middlebit + "topicmix"
 		s.AddFeedBuilder(mixtopicsuri, topicmix)
 
-		for _, f := range s.feeds {
-			if err := s.db.Create(&models.Feed{
-				Name:        f.Name,
-				Description: f.Description,
-			}).Error; err != nil {
-				fmt.Println(err)
+		if !maintenance {
+			for _, f := range s.feeds {
+				if err := s.db.Create(&models.Feed{
+					Name:        f.Name,
+					Description: f.Description,
+				}).Error; err != nil {
+					fmt.Println(err)
+				}
 			}
 		}
 
@@ -617,7 +625,7 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 			Feed:   feed,
 			Cursor: outcurs,
 		})
-	case "topic-art", "topic-gaming", "topic-animals", "topic-dev", "topic-bluesky", "topic-science":
+	case "topic-art", "topic-gaming", "topic-animals", "topic-dev", "topic-bluesky", "topic-science", "topic-tv", "topic-nature", "topic-writing", "topic-sports", "topic-books", "topic-comics", "topic-music":
 		// all of these feeds are fed by the same 'feed_incls' table
 		feed, outcurs, err := s.getTopicFeed(ctx, puri.Rkey, limit, cursor)
 		if err != nil {
@@ -1441,6 +1449,10 @@ func (s *Server) updateUserHandle(ctx context.Context, did string, handle string
 func (s *Server) handleLike(ctx context.Context, u *User, rec *bsky.FeedLike, path string) error {
 	parts := strings.Split(path, "/")
 
+	if rec.Subject == nil {
+		return fmt.Errorf("like had nil subject")
+	}
+
 	p, err := s.getPostByUri(ctx, rec.Subject.Uri)
 	if err != nil {
 		return err
@@ -1499,6 +1511,10 @@ func (s *Server) addPostToFeed(ctx context.Context, feed string, p *PostRef) err
 
 func (s *Server) handleRepost(ctx context.Context, u *User, rec *bsky.FeedRepost, path string) error {
 	parts := strings.Split(path, "/")
+
+	if rec.Subject == nil {
+		return fmt.Errorf("repost had nil subject")
+	}
 
 	p, err := s.getPostByUri(ctx, rec.Subject.Uri)
 	if err != nil {

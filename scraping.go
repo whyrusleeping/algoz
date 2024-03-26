@@ -139,9 +139,8 @@ func (s *Server) Run(ctx context.Context) error {
 			log.Errorf("failed to dial: %s", err)
 			time.Sleep(backoff)
 
-			backoff = (backoff * 2) + time.Second
-			if backoff > time.Minute*2 {
-				return fmt.Errorf("failed to dial for a long time")
+			if backoff < time.Minute {
+				backoff = (backoff * 2) + time.Second
 			}
 			continue
 		}

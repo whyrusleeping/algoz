@@ -47,8 +47,12 @@ func NewFollowLikes(s *Server) *FollowLikes {
 		liveUsers:   make(map[uint]*liveUserCache),
 	}
 
-	go fl.refresher()
-	go fl.janitor()
+	if s.Maintenance {
+		log.Errorf("follow likes, maintenance mode: limited functionality")
+	} else {
+		go fl.refresher()
+		go fl.janitor()
+	}
 
 	return fl
 }
