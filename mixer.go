@@ -50,10 +50,14 @@ func (f *TopicMixer) GetFeed(ctx context.Context, u *User, lim int, curs *string
 		return nil, err
 	}
 
-	ocurs := posts[len(posts)-1].CreatedAt.Format(time.RFC3339)
+	var ocurs *string
+	if len(posts) > 0 {
+		ts := posts[len(posts)-1].CreatedAt.Format(time.RFC3339)
+		ocurs = &ts
+	}
 
 	return &bsky.FeedGetFeedSkeleton_Output{
-		Cursor: &ocurs,
+		Cursor: ocurs,
 		Feed:   skelposts,
 	}, nil
 }
