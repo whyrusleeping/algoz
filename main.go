@@ -376,6 +376,12 @@ var runCmd = &cli.Command{
 		s.AddProcessor(NewImageLabeler(cctx.String("img-class-host"), s.db, s.xrpcc, fetcher, s.addPostToFeed))
 		//s.AddProcessor(NewGoodPostFinder(cctx.String("qualitea-class-host"), fetcher, s.addPostToFeed))
 
+		topicmix := &TopicMixer{
+			s: s,
+		}
+		mixtopicsuri := "at://" + middlebit + "topicmix"
+		s.AddFeedBuilder(mixtopicsuri, topicmix)
+
 		for _, f := range s.feeds {
 			if err := s.db.Create(&models.Feed{
 				Name:        f.Name,
