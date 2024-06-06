@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto"
 	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,15 +16,15 @@ import (
 	"sync"
 	"time"
 
-	api "github.com/bluesky-social/indigo/api"
 	"github.com/bluesky-social/indigo/api/atproto"
 	bsky "github.com/bluesky-social/indigo/api/bsky"
+	"github.com/bluesky-social/indigo/atproto/identity"
+	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/bluesky-social/indigo/did"
 	"github.com/bluesky-social/indigo/util"
 	cliutil "github.com/bluesky-social/indigo/util/cliutil"
 	"github.com/bluesky-social/indigo/xrpc"
-	es256k "github.com/ericvolp12/jwt-go-secp256k1"
-	"github.com/golang-jwt/jwt"
+	"github.com/golang-jwt/jwt/v5"
 	lru "github.com/hashicorp/golang-lru"
 	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log"
@@ -33,7 +35,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/whyrusleeping/algoz/models"
 	. "github.com/whyrusleeping/algoz/models"
-	"gitlab.com/yawning/secp256k1-voi/secec"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/crypto/acme/autocert"
@@ -114,11 +115,11 @@ func main() {
 }
 
 type Server struct {
-	db      *gorm.DB
-	bgshost string
-	xrpcc   *xrpc.Client
-	bgsxrpc *xrpc.Client
-	didr    did.Resolver
+	db        *gorm.DB
+	bgshost   string
+	xrpcc     *xrpc.Client
+	bgsxrpc   *xrpc.Client
+	directory identity.Directory
 
 	processors []Processor
 	fbm        map[string]FeedBuilder
@@ -221,6 +222,9 @@ var runCmd = &cli.Command{
 		e.Use(middleware.Logger())
 		e.HTTPErrorHandler = func(err error, c echo.Context) {
 			log.Error(err)
+			c.JSON(500, map[string]any{
+				"error": err.Error(),
+			})
 		}
 
 		xc := &xrpc.Client{
@@ -231,13 +235,7 @@ var runCmd = &cli.Command{
 			xc.Headers["X-Ratelimit-Bypass"] = rbt
 		}
 
-		plc := &api.PLCServer{
-			Host: cctx.String("plc-host"),
-		}
-
-		didr := did.NewMultiResolver()
-		didr.AddHandler("plc", plc)
-		didr.AddHandler("web", &did.WebResolver{})
+		dir := identity.DefaultDirectory()
 
 		bgsws := cctx.String("atp-bgs-host")
 		if !strings.HasPrefix(bgsws, "ws") {
@@ -260,7 +258,7 @@ var runCmd = &cli.Command{
 			bgshost:            cctx.String("atp-bgs-host"),
 			xrpcc:              xc,
 			bgsxrpc:            bgsxrpc,
-			didr:               didr,
+			directory:          dir,
 			userCache:          ucache,
 			keyCache:           kcache,
 			fbm:                make(map[string]FeedBuilder),
@@ -382,11 +380,8 @@ var runCmd = &cli.Command{
 		s.AddProcessor(NewImageLabeler(cctx.String("img-class-host"), s.db, s.xrpcc, fetcher, s.addPostToFeed))
 		//s.AddProcessor(NewGoodPostFinder(cctx.String("qualitea-class-host"), fetcher, s.addPostToFeed))
 
-		topicmix := &TopicMixer{
-			s: s,
-		}
 		mixtopicsuri := "at://" + middlebit + "topicmix"
-		s.AddFeedBuilder(mixtopicsuri, topicmix)
+		s.AddFeedBuilder(mixtopicsuri, NewTopicMixer(s))
 
 		if !maintenance {
 			for _, f := range s.feeds {
@@ -476,57 +471,54 @@ type cachedKey struct {
 	Key any
 }
 
-func (s *Server) getKeyForDid(did string) (any, error) {
-	doc, err := s.didr.GetDocument(context.TODO(), did)
+func (s *Server) getKeyForDid(ctx context.Context, did syntax.DID) (crypto.PublicKey, error) {
+	ident, err := s.directory.LookupDID(ctx, did)
 	if err != nil {
 		return nil, err
 	}
 
-	pubk, err := doc.GetPublicKey("#atproto")
-	if err != nil {
-		return nil, err
-	}
-
-	switch pubk.Type {
-	case "EcdsaSecp256k1VerificationKey2019":
-		seck, ok := pubk.Raw.(*secec.PublicKey)
-		if !ok {
-			return nil, fmt.Errorf("pubkey was invalid: %w", err)
-		}
-
-		return seck, nil
-	default:
-		return nil, fmt.Errorf("unrecognized key type: %q", pubk.Type)
-
-	}
-
+	return ident.PublicKey()
 }
 
 func (s *Server) fetchKey(tok *jwt.Token) (any, error) {
+	ctx := context.TODO()
+
 	issuer, ok := tok.Claims.(jwt.MapClaims)["iss"].(string)
 	if !ok {
-		return nil, fmt.Errorf("missing 'iss' field from auth header")
+		return nil, fmt.Errorf("missing 'iss' field from auth header JWT")
 	}
-
-	val, ok := s.keyCache.Get(issuer)
-	if ok {
-		ck := val.(*cachedKey)
-		if time.Now().Before(ck.EOL) {
-			return ck.Key, nil
-		}
-	}
-
-	k, err := s.getKeyForDid(issuer)
+	did, err := syntax.ParseDID(issuer)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid DID in 'iss' field from auth header JWT")
 	}
 
-	s.keyCache.Add(issuer, &cachedKey{
-		EOL: time.Now().Add(time.Minute * 10),
-		Key: k,
-	})
+	val, ok := s.keyCache.Get(did)
+	if ok {
+		return val, nil
+	}
 
+	k, err := s.getKeyForDid(ctx, did)
+	if err != nil {
+		return nil, fmt.Errorf("failed to look up public key for DID: %w", err)
+	}
+	s.keyCache.Add(did, k)
 	return k, nil
+}
+
+func (s *Server) checkJwt(ctx context.Context, tokv string) (string, error) {
+	return s.checkJwtConfig(ctx, tokv)
+}
+
+func (s *Server) checkJwtConfig(ctx context.Context, tokv string, config ...jwt.ParserOption) (string, error) {
+	validMethods := []string{SigningMethodES256K.Alg(), SigningMethodES256.Alg()}
+	config = append(config, jwt.WithValidMethods(validMethods))
+	p := jwt.NewParser(config...)
+	tok, err := p.Parse(tokv, s.fetchKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse auth header JWT: %w", err)
+	}
+	did := tok.Claims.(jwt.MapClaims)["iss"].(string)
+	return did, nil
 }
 
 type FeedItem struct {
@@ -564,7 +556,7 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 
 		did, err := s.checkJwt(ctx, parts[1])
 		if err != nil {
-			return err
+			return fmt.Errorf("check jwt: %w", err)
 		}
 
 		//did := "did:plc:vpkhqolt662uhesyj6nxm7ys"
@@ -684,23 +676,28 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 			Feed:   feed,
 			Cursor: outcurs,
 		})
+	case "latestmutuals":
+		if authedUser == nil {
+			return &echo.HTTPError{
+				Code:    403,
+				Message: "auth required for feed",
+			}
+		}
+		feed, outcurs, err := s.getMostRecentFromMutuals(ctx, authedUser, limit, cursor)
+		if err != nil {
+			return err
+		}
+
+		return e.JSON(200, &bsky.FeedGetFeedSkeleton_Output{
+			Feed:   feed,
+			Cursor: outcurs,
+		})
 	default:
 		return &echo.HTTPError{
 			Code:    400,
 			Message: "no such feed",
 		}
 	}
-}
-
-func (s *Server) checkJwt(ctx context.Context, tokv string) (string, error) {
-	p := new(jwt.Parser)
-	p.ValidMethods = []string{es256k.SigningMethodES256K.Alg()}
-	tok, err := p.Parse(tokv, s.fetchKey)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse jwt: %w", err)
-	}
-	did := tok.Claims.(jwt.MapClaims)["iss"].(string)
-	return did, nil
 }
 
 func (s *Server) getWhatsLit(ctx context.Context, limit int, cursor *string) ([]*bsky.FeedDefs_SkeletonFeedPost, *string, error) {
@@ -774,11 +771,24 @@ func (s *Server) getMostPop(ctx context.Context, limit int, cursor *string) ([]*
 }
 
 func (s *Server) scrapeFollowsForUser(ctx context.Context, u *User) error {
+
+	ident, err := s.directory.LookupDID(ctx, syntax.DID(u.Did))
+	if err != nil {
+		return fmt.Errorf("resolving authority for user: %w", err)
+	}
+
+	pdsUrl := ident.PDSEndpoint()
+
+	client := &xrpc.Client{Host: pdsUrl}
+	if strings.Contains(pdsUrl, "host.bsky.network") && !strings.Contains(pdsUrl, "hedgehog") {
+		client = s.xrpcc
+	}
+
 	var cursor string
 	for {
-		resp, err := atproto.RepoListRecords(ctx, s.xrpcc, "app.bsky.graph.follow", cursor, 100, u.Did, false, "", "")
+		resp, err := atproto.RepoListRecords(ctx, client, "app.bsky.graph.follow", cursor, 100, u.Did, false, "", "")
 		if err != nil {
-			return err
+			return fmt.Errorf("fetching follows: %w", err)
 		}
 
 		for _, rec := range resp.Records {
@@ -906,6 +916,80 @@ func (s *Server) getMostRecentFromFollows(ctx context.Context, u *User, limit in
 		Order("post_refs.created_at DESC").
 		Scan(&out).Error; err != nil {
 		return nil, nil, err
+	}
+
+	fp, err := s.postsToFeed(ctx, out)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	curs := fmt.Sprint(start + limit)
+
+	return fp, &curs, nil
+}
+
+func (s *Server) getMostRecentFromMutuals(ctx context.Context, u *User, limit int, cursor *string) ([]*bsky.FeedDefs_SkeletonFeedPost, *string, error) {
+	if !u.HasFollowsScraped() {
+		if err := s.scrapeFollowsForUser(ctx, u); err != nil {
+			return nil, nil, fmt.Errorf("caching follows: %w", err)
+		}
+	}
+
+	/*
+		query := `
+			SELECT post_refs.*
+			FROM post_refs
+			INNER JOIN (
+				SELECT following, MAX(created_at) as MaxCreated
+				FROM post_refs
+				INNER JOIN follows ON post_refs.uid = follows.following
+				WHERE follows.uid = ?
+				GROUP BY following
+			) post_refs_grouped ON post_refs.uid = post_refs_grouped.following AND post_refs.created_at = post_refs_grouped.MaxCreated
+		`
+	*/
+
+	start := 0
+	if cursor != nil {
+		num, err := strconv.Atoi(*cursor)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid cursor: %w", err)
+		}
+
+		start = num
+	}
+
+	var fusers []User
+	if err := s.db.Raw(`
+	WITH mutuals AS (
+		SELECT f1.following AS fid FROM follows f1 INNER JOIN follows f2 on f1.following = f2.uid AND f2.following = f1.uid WHERE f1.uid = ?
+	)
+	SELECT id, latest_post FROM mutuals LEFT JOIN users on fid = users.id`, u.ID).Scan(&fusers).Error; err != nil {
+		return nil, nil, fmt.Errorf("mutuals query failed: %w", err)
+	}
+
+	var out []PostRef
+	for _, f := range fusers {
+		p, err := s.latestPostForUser(ctx, f.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if p != nil {
+			out = append(out, *p)
+		}
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+
+	})
+
+	if start < len(out) {
+		out = out[start:]
+	}
+
+	if len(out) > limit {
+		out = out[:limit]
 	}
 
 	fp, err := s.postsToFeed(ctx, out)

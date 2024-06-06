@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	api "github.com/bluesky-social/indigo/api"
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	bsky "github.com/bluesky-social/indigo/api/bsky"
+	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/events/schedulers/autoscaling"
 	lexutil "github.com/bluesky-social/indigo/lex/util"
@@ -317,12 +317,12 @@ func (s *Server) getOrCreateUser(ctx context.Context, did string) (*User, error)
 }
 
 func (s *Server) handleFromDid(ctx context.Context, did string) (string, error) {
-	handle, _, err := api.ResolveDidToHandle(ctx, s.didr, &api.ProdHandleResolver{}, did)
+	resp, err := s.directory.LookupDID(ctx, syntax.DID(did))
 	if err != nil {
 		return "", err
 	}
 
-	return handle, nil
+	return resp.Handle.String(), nil
 }
 
 func (s *Server) Cleanup(epoch time.Time) error {
