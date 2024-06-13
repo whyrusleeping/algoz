@@ -935,20 +935,6 @@ func (s *Server) getMostRecentFromMutuals(ctx context.Context, u *User, limit in
 		}
 	}
 
-	/*
-		query := `
-			SELECT post_refs.*
-			FROM post_refs
-			INNER JOIN (
-				SELECT following, MAX(created_at) as MaxCreated
-				FROM post_refs
-				INNER JOIN follows ON post_refs.uid = follows.following
-				WHERE follows.uid = ?
-				GROUP BY following
-			) post_refs_grouped ON post_refs.uid = post_refs_grouped.following AND post_refs.created_at = post_refs_grouped.MaxCreated
-		`
-	*/
-
 	start := 0
 	if cursor != nil {
 		num, err := strconv.Atoi(*cursor)
