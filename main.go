@@ -570,6 +570,10 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 		span.SetAttributes(attribute.String("did", u.Did))
 	}
 
+	if authedUser == nil {
+		return fmt.Errorf("auth required")
+	}
+
 	var limit int = 100
 	if lims := e.QueryParam("limit"); lims != "" {
 		v, err := strconv.Atoi(lims)
@@ -1304,7 +1308,7 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 		NotFound:  false,
 	}
 
-	if rec.Reply != nil {
+	if rec.Reply != nil && rec.Reply.Root != nil {
 		repto, err := s.getPostByUri(ctx, rec.Reply.Parent.Uri)
 		if err != nil {
 			return err

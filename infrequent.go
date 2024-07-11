@@ -95,6 +95,7 @@ func (f *InfrequentPosters) GetFeed(ctx context.Context, u *User, limit int, cur
 		extra = "AND post_refs.created_at < ?"
 		params = []any{u.ID, c.T, oldest, c.C, limit}
 	} else {
+		extra = "AND post_refs.created_at < NOW()"
 		curs = &infreqCursor{T: 10}
 	}
 
