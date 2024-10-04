@@ -39,7 +39,7 @@ func (f *AllPicsFeed) GetFeed(ctx context.Context, u *User, lim int, cursor *str
 
 func (f *AllPicsFeed) HandlePost(ctx context.Context, u *User, pref *PostRef, rec *bsky.FeedPost) error {
 	if rec.Embed != nil && rec.Embed.EmbedImages != nil {
-		if err := f.s.addPostToFeed(ctx, "allpics", pref); err != nil {
+		if err := f.s.addPostToFeed(ctx, "allpics", pref.ID); err != nil {
 			return err
 		}
 	}
@@ -51,6 +51,6 @@ func (f *AllPicsFeed) HandleLike(context.Context, *User, *bsky.FeedPost) error {
 	return nil
 }
 
-func (f *AllPicsFeed) HandleRepost(context.Context, *User, *PostRef, string) error {
+func (f *AllPicsFeed) HandleRepost(context.Context, *User, *postInfo, string) error {
 	return nil
 }

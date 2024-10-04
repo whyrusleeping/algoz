@@ -32,8 +32,15 @@ func (f *InfrequentPosters) upkeep() {
 			log.Errorf("failed to refresh view: %s", err)
 		}
 
-		time.Sleep(time.Minute)
+		time.Sleep(time.Minute * 5)
 	}
+}
+
+type QuietPost struct {
+	ID        uint `gorm:"primarykey"`
+	CreatedAt time.Time
+	Author    uint
+	Post      uint
 }
 
 type infreqCursor struct {
@@ -73,13 +80,13 @@ func (ifc *infreqCursor) ToString() string {
 func (f *InfrequentPosters) GetFeed(ctx context.Context, u *User, limit int, cursor *string) (*bsky.FeedGetFeedSkeleton_Output, error) {
 	if !u.HasFollowsScraped() {
 		if err := f.s.scrapeFollowsForUser(ctx, u); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to scrape follows: %w", err)
 		}
 	}
 
 	oldest := time.Now().Add(time.Hour * -24)
 
-	params := []any{u.ID, 10, oldest, limit}
+	params := []any{u.ID, oldest, limit}
 	var extra string
 	var curs *infreqCursor
 	if cursor != nil {
@@ -93,11 +100,20 @@ func (f *InfrequentPosters) GetFeed(ctx context.Context, u *User, limit int, cur
 		oldest = c.C.Add(time.Hour * -24)
 
 		extra = "AND post_refs.created_at < ?"
-		params = []any{u.ID, c.T, oldest, c.C, limit}
+		params = []any{u.ID, oldest, c.C, limit}
 	} else {
 		extra = "AND post_refs.created_at < NOW()"
 		curs = &infreqCursor{T: 10}
 	}
+
+	nqs := fmt.Sprintf(`SELECT post_refs.* FROM quiet_posts
+		LEFT JOIN post_refs ON quiet_posts.post = post_refs.id 
+		WHERE 
+			quiet_posts.author in (SELECT following FROM follows WHERE uid = ?) AND 
+			quiet_posts.created_at > ?
+			%s
+		ORDER BY quiet_posts.created_at DESC
+		LIMIT ?`, extra)
 
 	qs := fmt.Sprintf(`SELECT * FROM post_refs
 		WHERE post_refs.uid IN (SELECT following
@@ -111,6 +127,9 @@ func (f *InfrequentPosters) GetFeed(ctx context.Context, u *User, limit int, cur
 		ORDER BY post_refs.created_at DESC
 		LIMIT ?;`, extra)
 
+	_ = nqs
+	qs = nqs
+
 	var out []PostRef
 	q := f.s.db.Raw(qs, params...)
 	if err := q.Find(&out).Error; err != nil {
@@ -118,17 +137,19 @@ func (f *InfrequentPosters) GetFeed(ctx context.Context, u *User, limit int, cur
 	}
 
 	// first request, not many results back
-	if cursor == nil && len(out) < 20 {
-		curs.T = 20
+	/*
+		if cursor == nil && len(out) < 20 {
+			curs.T = 20
 
-		params[1] = 20
+			params[1] = 20
 
-		var out []PostRef
-		q := f.s.db.Raw(qs, params...)
-		if err := q.Find(&out).Error; err != nil {
-			return nil, err
+			var out []PostRef
+			q := f.s.db.Raw(qs, params...)
+			if err := q.Find(&out).Error; err != nil {
+				return nil, err
+			}
 		}
-	}
+	*/
 
 	skelposts, err := f.s.postsToFeed(ctx, out)
 	if err != nil {
@@ -147,7 +168,36 @@ func (f *InfrequentPosters) GetFeed(ctx context.Context, u *User, limit int, cur
 	}, nil
 }
 
-func (f *InfrequentPosters) HandlePost(context.Context, *User, *PostRef, *bsky.FeedPost) error {
+func (f *InfrequentPosters) isPosterQuiet(u *User) (bool, error) {
+	var cnt int
+	if err := f.s.db.Raw("SELECT count FROM usr_post_counts WHERE uid = ?", u.ID).Scan(&cnt).Error; err != nil {
+		return false, fmt.Errorf("checking user post counts: %w", err)
+	}
+
+	if cnt < 10 {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func (f *InfrequentPosters) HandlePost(ctx context.Context, u *User, pref *PostRef, fp *bsky.FeedPost) error {
+	q, err := f.isPosterQuiet(u)
+	if err != nil {
+		return err
+	}
+
+	if !q {
+		return nil
+	}
+
+	if err := f.s.db.Create(&QuietPost{
+		Author: pref.Uid,
+		Post:   pref.ID,
+	}).Error; err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -155,6 +205,6 @@ func (f *InfrequentPosters) HandleLike(context.Context, *User, *bsky.FeedPost) e
 	return nil
 }
 
-func (f *InfrequentPosters) HandleRepost(context.Context, *User, *PostRef, string) error {
+func (f *InfrequentPosters) HandleRepost(context.Context, *User, *postInfo, string) error {
 	return nil
 }

@@ -12,7 +12,7 @@ import (
 	bsky "github.com/bluesky-social/indigo/api/bsky"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/bluesky-social/indigo/events"
-	"github.com/bluesky-social/indigo/events/schedulers/autoscaling"
+	"github.com/bluesky-social/indigo/events/schedulers/parallel"
 	lexutil "github.com/bluesky-social/indigo/lex/util"
 	"github.com/bluesky-social/indigo/repo"
 	"github.com/bluesky-social/indigo/repomgr"
@@ -91,6 +91,10 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 
 			for _, op := range evt.Ops {
+				if !interestedInRecordType(op.Path) {
+					continue
+				}
+
 				ek := repomgr.EventKind(op.Action)
 				switch ek {
 				case repomgr.EvtKindCreateRecord, repomgr.EvtKindUpdateRecord:
@@ -147,14 +151,24 @@ func (s *Server) Run(ctx context.Context) error {
 
 		backoff = 0
 
-		opts := autoscaling.DefaultAutoscaleSettings()
-		opts.Concurrency = 20
-		opts.MaxConcurrency = 100
-		sched := autoscaling.NewScheduler(opts, "", handleFunc)
+		sched := parallel.NewScheduler(100, 1000, con.RemoteAddr().String(), handleFunc)
 		if err := events.HandleRepoStream(ctx, con, sched); err != nil {
 			log.Errorf("stream processing error: %s", err)
 		}
 	}
+}
+
+func interestedInRecordType(path string) bool {
+	cols := map[string]bool{
+		"app.bsky.feed.post":     true,
+		"app.bsky.actor.profile": true,
+		"app.bsky.feed.like":     true,
+		"app.bsky.feed.repost":   true,
+		"app.bsky.graph.follow":  true,
+		"app.bsky.graph.block":   true,
+	}
+	parts := strings.Split(path, "/")
+	return cols[parts[0]]
 }
 
 // handleOp receives every incoming repo event and is where indexing logic lives

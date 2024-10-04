@@ -28,7 +28,7 @@ func (f *FollowPics) GetFeed(ctx context.Context, u *User, limit int, cursor *st
 		}
 	}
 
-	oldest := time.Now().Add(time.Hour * -24)
+	oldest := time.Now().Add(time.Hour * -6)
 
 	params := []any{u.ID, oldest, limit}
 	var extra string
@@ -38,7 +38,7 @@ func (f *FollowPics) GetFeed(ctx context.Context, u *User, limit int, cursor *st
 			return nil, err
 		}
 
-		oldest = t.Add(time.Hour * -24)
+		oldest = t.Add(time.Hour * -6)
 
 		extra = "AND post_refs.created_at < ?"
 		params = []any{u.ID, oldest, t, limit}
@@ -92,6 +92,6 @@ func (f *FollowPics) HandleLike(context.Context, *User, *bsky.FeedPost) error {
 	return nil
 }
 
-func (f *FollowPics) HandleRepost(context.Context, *User, *PostRef, string) error {
+func (f *FollowPics) HandleRepost(context.Context, *User, *postInfo, string) error {
 	return nil
 }

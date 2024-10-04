@@ -26,6 +26,7 @@ import (
 	"github.com/bluesky-social/indigo/xrpc"
 	"github.com/golang-jwt/jwt/v5"
 	lru "github.com/hashicorp/golang-lru"
+	"github.com/hashicorp/golang-lru/arc/v2"
 	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log"
 	"github.com/labstack/echo/v4"
@@ -84,7 +85,7 @@ type Labeler interface {
 type Processor interface {
 	HandlePost(context.Context, *User, *PostRef, *bsky.FeedPost) error
 	HandleLike(context.Context, *User, *bsky.FeedPost) error
-	HandleRepost(context.Context, *User, *PostRef, string) error
+	HandleRepost(context.Context, *User, *postInfo, string) error
 }
 
 type LastSeq struct {
@@ -130,6 +131,8 @@ type Server struct {
 	userLk    sync.Mutex
 	userCache *lru.Cache
 	keyCache  *lru.Cache
+
+	postCache *arc.ARCCache[syntax.ATURI, *postInfo] // fast string (AT-URI) to {uid, post-id}; mapping is stable
 
 	Maintenance        bool
 	MaintenancePostUri string
@@ -215,13 +218,15 @@ var runCmd = &cli.Command{
 			db.AutoMigrate(&models.Block{})
 			db.AutoMigrate(&UserAssoc{})
 			db.AutoMigrate(&PostText{})
+			db.AutoMigrate(&PostCountTask{})
+			db.AutoMigrate(&QuietPost{})
 		}
 
 		log.Infof("Configuring HTTP server")
 		e := echo.New()
 		e.Use(middleware.Logger())
 		e.HTTPErrorHandler = func(err error, c echo.Context) {
-			log.Error(err)
+			log.Errorf("failed handling %s: %s", c.Path(), err)
 			c.JSON(500, map[string]any{
 				"error": err.Error(),
 			})
@@ -251,8 +256,9 @@ var runCmd = &cli.Command{
 			bgsxrpc.Headers["X-Ratelimit-Bypass"] = rbt
 		}
 
-		ucache, _ := lru.New(100000)
-		kcache, _ := lru.New(100000)
+		ucache, _ := lru.New(500_000)
+		kcache, _ := lru.New(500_000)
+		pcache, _ := arc.NewARC[syntax.ATURI, *postInfo](1_000_000)
 		s := &Server{
 			db:                 db,
 			bgshost:            cctx.String("atp-bgs-host"),
@@ -264,7 +270,10 @@ var runCmd = &cli.Command{
 			fbm:                make(map[string]FeedBuilder),
 			Maintenance:        cctx.Bool("maintenance"),
 			MaintenancePostUri: "at://did:plc:vpkhqolt662uhesyj6nxm7ys/app.bsky.feed.post/3kkcyoihzlk2b",
+			postCache:          pcache,
 		}
+
+		go s.runCountAggregator()
 
 		if d := cctx.String("did-doc"); d != "" {
 			doc, err := loadDidDocument(d)
@@ -375,9 +384,9 @@ var runCmd = &cli.Command{
 		folikeuri := "at://" + middlebit + "followlikes"
 		s.AddFeedBuilder(folikeuri, NewFollowLikes(s))
 
-		fetcher := NewImageFetcher(s.xrpcc)
+		//fetcher := NewImageFetcher(s.xrpcc)
 
-		s.AddProcessor(NewImageLabeler(cctx.String("img-class-host"), s.db, s.xrpcc, fetcher, s.addPostToFeed))
+		//s.AddProcessor(NewImageLabeler(cctx.String("img-class-host"), s.db, s.xrpcc, fetcher, s.addPostToFeed))
 		//s.AddProcessor(NewGoodPostFinder(cctx.String("qualitea-class-host"), fetcher, s.addPostToFeed))
 
 		mixtopicsuri := "at://" + middlebit + "topicmix"
@@ -1245,13 +1254,11 @@ func (s *Server) deleteLike(ctx context.Context, u *User, path string) error {
 		return nil
 	}
 
-	return s.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&PostRef{}).Where("id = ?", lk.Ref).Update("likes", gorm.Expr("likes - 1")).Error; err != nil {
-			return err
-		}
+	if err := s.decrementLikeCount(ctx, lk.Ref); err != nil {
+		return err
+	}
 
-		return tx.Delete(&FeedLike{}, "id = ?", lk.ID).Error
-	})
+	return s.db.Delete(&FeedLike{}, "id = ?", lk.ID).Error
 }
 
 func (s *Server) deleteRepost(ctx context.Context, u *User, path string) error {
@@ -1268,13 +1275,11 @@ func (s *Server) deleteRepost(ctx context.Context, u *User, path string) error {
 		return fmt.Errorf("could not find repost: uid=%d, %s", u.ID, path)
 	}
 
-	return s.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&PostRef{}).Where("id = ?", rp.Ref).Update("reposts", gorm.Expr("reposts - 1")).Error; err != nil {
-			return err
-		}
+	if err := s.decrementRepostCount(ctx, rp.Ref); err != nil {
+		return err
+	}
 
-		return tx.Delete(&rp).Error
-	})
+	return s.db.Delete(&rp).Error
 }
 
 func (s *Server) deleteFollow(ctx context.Context, u *User, path string) error {
@@ -1309,14 +1314,14 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 	}
 
 	if rec.Reply != nil && rec.Reply.Root != nil {
-		repto, err := s.getPostByUri(ctx, rec.Reply.Parent.Uri)
+		repto, err := s.getPostInfo(ctx, rec.Reply.Parent.Uri)
 		if err != nil {
 			return err
 		}
 		pref.ReplyTo = repto.ID
 		pref.IsReply = true
 
-		reproot, err := s.getPostByUri(ctx, rec.Reply.Root.Uri)
+		reproot, err := s.getPostInfo(ctx, rec.Reply.Root.Uri)
 		if err != nil {
 			return err
 		}
@@ -1337,7 +1342,7 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 			rpref = rec.Embed.EmbedRecordWithMedia.Record.Record.Uri
 		}
 		if rpref != "" && strings.Contains(rpref, "app.bsky.feed.post") {
-			rp, err := s.getPostByUri(ctx, rpref)
+			rp, err := s.getPostInfo(ctx, rpref)
 			if err != nil {
 				return err
 			}
@@ -1376,7 +1381,7 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 	}
 
 	if u.Blessed {
-		if err := s.addPostToFeed(ctx, "coolstuff", pref); err != nil {
+		if err := s.addPostToFeed(ctx, "coolstuff", pref.ID); err != nil {
 			return err
 		}
 	}
@@ -1403,6 +1408,7 @@ func (s *Server) setUserLastPost(u *User, p *PostRef) error {
 	})
 }
 
+/*
 func (s *Server) incrementReplyTo(ctx context.Context, uri string) error {
 	pref, err := s.getPostByUri(ctx, uri)
 	if err != nil {
@@ -1415,6 +1421,7 @@ func (s *Server) incrementReplyTo(ctx context.Context, uri string) error {
 
 	return err
 }
+*/
 
 func (s *Server) getPostByUri(ctx context.Context, uri string) (*PostRef, error) {
 	puri, err := util.ParseAtUri(uri)
@@ -1487,19 +1494,6 @@ func (s *Server) getRecord(ctx context.Context, uri string) (*bsky.FeedPost, cid
 	return fp, c, nil
 }
 
-func (s *Server) incrementReplyRoot(ctx context.Context, uri string) error {
-	pref, err := s.getPostByUri(ctx, uri)
-	if err != nil {
-		return err
-	}
-
-	if err := s.db.Model(&PostRef{}).Where("id = ?", pref.ID).Update("thread_size", gorm.Expr("thread_size + 1")).Error; err != nil {
-		return err
-	}
-
-	return err
-}
-
 func (s *Server) indexProfile(ctx context.Context, u *User, rec *bsky.ActorProfile) error {
 	n := ""
 	if rec.DisplayName != nil {
@@ -1527,7 +1521,7 @@ func (s *Server) handleLike(ctx context.Context, u *User, rec *bsky.FeedLike, pa
 		return fmt.Errorf("like had nil subject")
 	}
 
-	p, err := s.getPostByUri(ctx, rec.Subject.Uri)
+	p, err := s.getPostInfo(ctx, rec.Subject.Uri)
 	if err != nil {
 		return err
 	}
@@ -1542,15 +1536,17 @@ func (s *Server) handleLike(ctx context.Context, u *User, rec *bsky.FeedLike, pa
 		return err
 	}
 
-	if err := s.db.Model(&PostRef{}).Where("id = ?", p.ID).Update("likes", gorm.Expr("likes + 1")).Error; err != nil {
+	if err := s.incrementLikeCount(ctx, p.ID); err != nil {
 		return err
 	}
 
-	if p.Likes == 11 {
-		if err := s.addPostToFeed(ctx, "upandup", p); err != nil {
-			return err
+	/*
+		if p.Likes == 11 {
+			if err := s.addPostToFeed(ctx, "upandup", p.ID); err != nil {
+				return err
+			}
 		}
-	}
+	*/
 
 	return nil
 }
@@ -1564,7 +1560,7 @@ func (s *Server) getFeedRef(ctx context.Context, feed string) (*Feed, error) {
 	return &f, nil
 }
 
-func (s *Server) addPostToFeed(ctx context.Context, feed string, p *PostRef) error {
+func (s *Server) addPostToFeed(ctx context.Context, feed string, pid uint) error {
 	f, err := s.getFeedRef(ctx, feed)
 	if err != nil {
 		return err
@@ -1574,7 +1570,7 @@ func (s *Server) addPostToFeed(ctx context.Context, feed string, p *PostRef) err
 		Columns:   []clause.Column{{Name: "feed"}, {Name: "post"}},
 		DoNothing: true,
 	}).Create(&FeedIncl{
-		Post: p.ID,
+		Post: pid,
 		Feed: f.ID,
 	}).Error; err != nil {
 		return err
@@ -1590,7 +1586,7 @@ func (s *Server) handleRepost(ctx context.Context, u *User, rec *bsky.FeedRepost
 		return fmt.Errorf("repost had nil subject")
 	}
 
-	p, err := s.getPostByUri(ctx, rec.Subject.Uri)
+	p, err := s.getPostInfo(ctx, rec.Subject.Uri)
 	if err != nil {
 		return err
 	}
@@ -1603,7 +1599,7 @@ func (s *Server) handleRepost(ctx context.Context, u *User, rec *bsky.FeedRepost
 		return err
 	}
 
-	if err := s.db.Model(&PostRef{}).Where("id = ?", p.ID).Update("reposts", gorm.Expr("reposts + 1")).Error; err != nil {
+	if err := s.incrementRepostCount(ctx, p.ID); err != nil {
 		return err
 	}
 

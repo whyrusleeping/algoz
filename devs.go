@@ -102,7 +102,7 @@ func (f *DevFeed) userIsDev(ctx context.Context, u *User) (bool, error) {
 
 func (f *DevFeed) HandlePost(ctx context.Context, u *User, pr *PostRef, fp *bsky.FeedPost) error {
 	if strings.Contains(fp.Text, "#atdev") || strings.Contains(fp.Text, "#atproto") || strings.Contains(fp.Text, "github.com/bluesky-social") {
-		if err := f.s.addPostToFeed(ctx, "devfeed", pr); err != nil {
+		if err := f.s.addPostToFeed(ctx, "devfeed", pr.ID); err != nil {
 			return err
 		}
 		return nil
@@ -114,7 +114,7 @@ func (f *DevFeed) HandlePost(ctx context.Context, u *User, pr *PostRef, fp *bsky
 	}
 	if isDev {
 		if containsDevKeywords(fp.Text) {
-			if err := f.s.addPostToFeed(ctx, "devfeed", pr); err != nil {
+			if err := f.s.addPostToFeed(ctx, "devfeed", pr.ID); err != nil {
 				return err
 			}
 		}
@@ -126,14 +126,14 @@ func (f *DevFeed) HandleLike(context.Context, *User, *bsky.FeedPost) error {
 	return nil
 }
 
-func (f *DevFeed) HandleRepost(ctx context.Context, u *User, pref *PostRef, text string) error {
+func (f *DevFeed) HandleRepost(ctx context.Context, u *User, pref *postInfo, text string) error {
 	isDev, err := f.userIsDev(ctx, u)
 	if err != nil {
 		return err
 	}
 	if isDev {
 		if containsDevKeywords(text) {
-			if err := f.s.addPostToFeed(ctx, "devfeed", pref); err != nil {
+			if err := f.s.addPostToFeed(ctx, "devfeed", pref.ID); err != nil {
 				return err
 			}
 		}

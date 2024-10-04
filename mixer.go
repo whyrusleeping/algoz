@@ -145,10 +145,12 @@ func (f *TopicMixer) GetFeed(ctx context.Context, u *User, lim int, curs *string
 	})
 
 	var out []*PostRef
-	for i := 0; i < (offs+lim)*4; i++ {
-		p := sources[i%len(sources)].Take()
-		if p != nil {
-			out = append(out, p)
+	if len(sources) > 0 {
+		for i := 0; i < (offs+lim)*4; i++ {
+			p := sources[i%len(sources)].Take()
+			if p != nil {
+				out = append(out, p)
+			}
 		}
 	}
 
@@ -213,6 +215,6 @@ func (f *TopicMixer) HandleLike(context.Context, *User, *bsky.FeedPost) error {
 	return nil
 }
 
-func (f *TopicMixer) HandleRepost(context.Context, *User, *PostRef, string) error {
+func (f *TopicMixer) HandleRepost(context.Context, *User, *postInfo, string) error {
 	return nil
 }

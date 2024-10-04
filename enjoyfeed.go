@@ -222,6 +222,6 @@ func (f *EnjoyFeed) HandleLike(context.Context, *User, *bsky.FeedPost) error {
 	return nil
 }
 
-func (f *EnjoyFeed) HandleRepost(context.Context, *User, *PostRef, string) error {
+func (f *EnjoyFeed) HandleRepost(context.Context, *User, *postInfo, string) error {
 	return nil
 }

@@ -36,7 +36,7 @@ func (f *QuotePostsFeed) GetFeed(ctx context.Context, u *User, lim int, cursor *
 
 func (f *QuotePostsFeed) HandlePost(ctx context.Context, u *User, pref *PostRef, rec *bsky.FeedPost) error {
 	if rec.Embed != nil && rec.Embed.EmbedRecord != nil {
-		if err := f.s.addPostToFeed(ctx, "allqps", pref); err != nil {
+		if err := f.s.addPostToFeed(ctx, "allqps", pref.ID); err != nil {
 			return err
 		}
 	}
@@ -48,6 +48,6 @@ func (f *QuotePostsFeed) HandleLike(context.Context, *User, *bsky.FeedPost) erro
 	return nil
 }
 
-func (f *QuotePostsFeed) HandleRepost(context.Context, *User, *PostRef, string) error {
+func (f *QuotePostsFeed) HandleRepost(context.Context, *User, *postInfo, string) error {
 	return nil
 }
