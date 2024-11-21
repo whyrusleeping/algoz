@@ -133,6 +133,7 @@ type Server struct {
 	keyCache  *lru.Cache
 
 	postCache *arc.ARCCache[syntax.ATURI, *postInfo] // fast string (AT-URI) to {uid, post-id}; mapping is stable
+	didCache  *arc.ARCCache[uint, string]
 
 	Maintenance        bool
 	MaintenancePostUri string
@@ -200,7 +201,7 @@ var runCmd = &cli.Command{
 		var db *gorm.DB
 
 		if !maintenance {
-			adb, err := cliutil.SetupDatabase(cctx.String("database-url"), 40)
+			adb, err := cliutil.SetupDatabase(cctx.String("database-url"), 60)
 			if err != nil {
 				return err
 			}
@@ -256,9 +257,10 @@ var runCmd = &cli.Command{
 			bgsxrpc.Headers["X-Ratelimit-Bypass"] = rbt
 		}
 
-		ucache, _ := lru.New(500_000)
-		kcache, _ := lru.New(500_000)
-		pcache, _ := arc.NewARC[syntax.ATURI, *postInfo](1_000_000)
+		ucache, _ := lru.New(1_500_000)
+		kcache, _ := lru.New(1_500_000)
+		pcache, _ := arc.NewARC[syntax.ATURI, *postInfo](3_000_000)
+		dcache, _ := arc.NewARC[uint, string](3_000_000)
 		s := &Server{
 			db:                 db,
 			bgshost:            cctx.String("atp-bgs-host"),
@@ -271,6 +273,7 @@ var runCmd = &cli.Command{
 			Maintenance:        cctx.Bool("maintenance"),
 			MaintenancePostUri: "at://did:plc:vpkhqolt662uhesyj6nxm7ys/app.bsky.feed.post/3kkcyoihzlk2b",
 			postCache:          pcache,
+			didCache:           dcache,
 		}
 
 		go s.runCountAggregator()
@@ -348,10 +351,12 @@ var runCmd = &cli.Command{
 			s:    s,
 		})
 
-		allqpsuri := "at://" + middlebit + "allqps"
-		s.AddFeedBuilder(allqpsuri, &QuotePostsFeed{
-			s: s,
-		})
+		/*
+			allqpsuri := "at://" + middlebit + "allqps"
+			s.AddFeedBuilder(allqpsuri, &QuotePostsFeed{
+				s: s,
+			})
+		*/
 
 		followpicsuri := "at://" + middlebit + "followpics"
 		s.AddFeedBuilder(followpicsuri, &FollowPics{
@@ -437,7 +442,8 @@ var runCmd = &cli.Command{
 		}
 
 		ctx := context.TODO()
-		if err := s.Run(ctx); err != nil {
+		//if err := s.Run(ctx); err != nil {
+		if err := s.RunJetstream(ctx); err != nil {
 			return fmt.Errorf("failed to run: %w", err)
 		}
 
@@ -837,41 +843,50 @@ func (s *Server) scrapeFollowsForUser(ctx context.Context, u *User) error {
 	return nil
 }
 
-func (s *Server) latestPostForUser(ctx context.Context, uid uint) (*PostRef, error) {
-	var u User
-	if err := s.db.First(&u, "id = ?", uid).Error; err != nil {
-		return nil, err
+func (s *Server) latestPostForUser(ctx context.Context, did string) (uint, error) {
+	u, err := s.getOrCreateUser(ctx, did)
+	if err != nil {
+		return 0, err
 	}
 
-	lp := u.LatestPost
+	// since we are updating these live off the firehose, we shouldnt ever need to look this up
+	return u.LatestPost, nil
 
-	if lp == 0 {
+	/*
+		if lp != 0 {
+			return lp, nil
+		}
+
 		var p PostRef
-		if err := s.db.Order("created_at DESC").Limit(1).Find(&p, "uid = ? AND NOT is_reply", uid).Error; err != nil {
-			return nil, err
+		if err := s.db.Order("created_at DESC").Limit(1).Find(&p, "uid = ? AND NOT is_reply", u.ID).Error; err != nil {
+			return 0, err
 		}
 
 		if p.ID == 0 {
-			return nil, nil
+			return 0, nil
 		}
 
-		if err := s.setUserLastPost(&u, &p); err != nil {
-			return nil, err
+		if err := s.setUserLastPost(u, &p); err != nil {
+			return 0, err
 		}
 
-		return &p, nil
-	} else {
-		var p PostRef
-		if err := s.db.Find(&p, "id = ?", lp).Error; err != nil {
-			return nil, err
-		}
+		return p.ID, nil
+	*/
+}
 
-		if p.ID == 0 {
-			return nil, nil
-		}
-
-		return &p, nil
+func (s *Server) didFromId(ctx context.Context, uid uint) (string, error) {
+	v, ok := s.didCache.Get(uid)
+	if ok {
+		return v, nil
 	}
+
+	var outdid string
+	if err := s.db.Raw("SELECT did FROM users WHERE id = ?", uid).Scan(&outdid).Error; err != nil {
+		return "", err
+	}
+
+	s.didCache.Add(uid, outdid)
+	return outdid, nil
 }
 
 func (s *Server) getMostRecentFromFollows(ctx context.Context, u *User, limit int, cursor *string) ([]*bsky.FeedDefs_SkeletonFeedPost, *string, error) {
@@ -880,20 +895,6 @@ func (s *Server) getMostRecentFromFollows(ctx context.Context, u *User, limit in
 			return nil, nil, err
 		}
 	}
-
-	/*
-		query := `
-			SELECT post_refs.*
-			FROM post_refs
-			INNER JOIN (
-				SELECT following, MAX(created_at) as MaxCreated
-				FROM post_refs
-				INNER JOIN follows ON post_refs.uid = follows.following
-				WHERE follows.uid = ?
-				GROUP BY following
-			) post_refs_grouped ON post_refs.uid = post_refs_grouped.following AND post_refs.created_at = post_refs_grouped.MaxCreated
-		`
-	*/
 
 	start := 0
 	if cursor != nil {
@@ -905,29 +906,29 @@ func (s *Server) getMostRecentFromFollows(ctx context.Context, u *User, limit in
 		start = num
 	}
 
-	var fusers []User
-	if err := s.db.Table("follows").Joins("LEFT JOIN users on follows.following = users.id").Where("follows.uid = ?", u.ID).Limit(limit).Offset(start).Order("follows.id ASC").Scan(&fusers).Error; err != nil {
+	var fuids []uint
+	if err := s.db.Raw("SELECT following FROM follows WHERE uid = ?", u.ID).Scan(&fuids).Error; err != nil {
 		return nil, nil, err
 	}
 
-	for _, f := range fusers {
-		if f.LatestPost == 0 {
-			_, err := s.latestPostForUser(ctx, f.ID)
-			if err != nil {
-				return nil, nil, err
-			}
+	var latests []uint
+	for _, fid := range fuids {
+		f, err := s.didFromId(ctx, fid)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		pid, err := s.latestPostForUser(ctx, f)
+		if err != nil {
+			return nil, nil, err
+		}
+		if pid != 0 {
+			latests = append(latests, pid)
 		}
 	}
 
 	var out []PostRef
-	if err := s.db.Table("follows").
-		Joins("LEFT JOIN users on follows.following = users.id").
-		Joins("INNER JOIN post_refs on users.latest_post = post_refs.id").
-		Where("follows.uid = ?", u.ID).
-		Limit(limit).
-		Offset(start).
-		Order("post_refs.created_at DESC").
-		Scan(&out).Error; err != nil {
+	if err := s.db.Raw("SELECT * FROM post_refs WHERE id IN (?) ORDER BY created_at DESC LIMIT ? OFFSET ?", latests, limit, start).Scan(&out).Error; err != nil {
 		return nil, nil, err
 	}
 
@@ -958,40 +959,44 @@ func (s *Server) getMostRecentFromMutuals(ctx context.Context, u *User, limit in
 		start = num
 	}
 
-	var fusers []User
+	var fusers []string
 	if err := s.db.Raw(`
 	WITH mutuals AS (
 		SELECT f1.following AS fid FROM follows f1 INNER JOIN follows f2 on f1.following = f2.uid AND f2.following = f1.uid WHERE f1.uid = ?
 	)
-	SELECT id, latest_post FROM mutuals LEFT JOIN users on fid = users.id`, u.ID).Scan(&fusers).Error; err != nil {
+	SELECT did FROM mutuals LEFT JOIN users on fid = users.id`, u.ID).Scan(&fusers).Error; err != nil {
 		return nil, nil, fmt.Errorf("mutuals query failed: %w", err)
 	}
 
-	var out []PostRef
+	var out []uint
 	for _, f := range fusers {
-		p, err := s.latestPostForUser(ctx, f.ID)
+		pid, err := s.latestPostForUser(ctx, f)
 		if err != nil {
 			return nil, nil, err
 		}
-		if p != nil {
-			out = append(out, *p)
+		if pid != 0 {
+			out = append(out, pid)
 		}
 	}
 
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].CreatedAt.After(out[j].CreatedAt)
+	var latests []PostRef
+	if err := s.db.Find(&latests, "id IN (?)", out).Error; err != nil {
+		return nil, nil, err
+	}
 
+	sort.Slice(latests, func(i, j int) bool {
+		return latests[i].CreatedAt.After(latests[j].CreatedAt)
 	})
 
-	if start < len(out) {
-		out = out[start:]
+	if start < len(latests) {
+		latests = latests[start:]
 	}
 
-	if len(out) > limit {
-		out = out[:limit]
+	if len(latests) > limit {
+		latests = latests[:limit]
 	}
 
-	fp, err := s.postsToFeed(ctx, out)
+	fp, err := s.postsToFeed(ctx, latests)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1232,6 +1237,8 @@ func (s *Server) handleServeDidDoc(e echo.Context) error {
 	return e.JSON(200, s.didDoc)
 }
 
+var ErrMissingDeleteTarget = fmt.Errorf("missing delete target")
+
 func (s *Server) deletePost(ctx context.Context, u *User, path string) error {
 	log.Debugf("deleting post: %s", path)
 
@@ -1272,7 +1279,7 @@ func (s *Server) deleteRepost(ctx context.Context, u *User, path string) error {
 	}
 
 	if rp.ID == 0 {
-		return fmt.Errorf("could not find repost: uid=%d, %s", u.ID, path)
+		return fmt.Errorf("could not find repost: uid=%d, %s: %w", u.ID, path, ErrMissingDeleteTarget)
 	}
 
 	if err := s.decrementRepostCount(ctx, rp.Ref); err != nil {
@@ -1294,7 +1301,7 @@ func (s *Server) deleteFollow(ctx context.Context, u *User, path string) error {
 	return nil
 }
 
-func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, path string, pcid cid.Cid) error {
+func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, path string) error {
 	log.Debugf("indexing post: %s", path)
 
 	t, err := time.Parse(util.ISO8601, rec.CreatedAt)
@@ -1306,11 +1313,11 @@ func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, pat
 	rkey := parts[len(parts)-1]
 
 	pref := &PostRef{
-		CreatedAt: t,
-		Cid:       pcid.String(),
-		Rkey:      rkey,
-		Uid:       u.ID,
-		NotFound:  false,
+		CreatedAt:   time.Now(),
+		PostCreated: t,
+		Rkey:        rkey,
+		Uid:         u.ID,
+		NotFound:    false,
 	}
 
 	if rec.Reply != nil && rec.Reply.Root != nil {

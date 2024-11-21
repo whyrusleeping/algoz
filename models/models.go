@@ -8,8 +8,9 @@ import (
 )
 
 type PostRef struct {
-	ID        uint      `gorm:"primarykey"`
-	CreatedAt time.Time `gorm:"index:idx_post_uid_created"`
+	ID          uint      `gorm:"primarykey"`
+	CreatedAt   time.Time `gorm:"index:idx_post_uid_created"`
+	PostCreated time.Time
 
 	Cid        string
 	Rkey       string `gorm:"uniqueIndex:idx_post_rkeyuid"`

@@ -32,7 +32,7 @@ func (f *InfrequentPosters) upkeep() {
 			log.Errorf("failed to refresh view: %s", err)
 		}
 
-		time.Sleep(time.Minute * 5)
+		time.Sleep(time.Minute * 10)
 	}
 }
 

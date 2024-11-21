@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"sort"
-	"strconv"
 	"sync"
 	"time"
 
@@ -47,12 +45,14 @@ func NewFollowLikes(s *Server) *FollowLikes {
 		liveUsers:   make(map[uint]*liveUserCache),
 	}
 
-	if s.Maintenance {
-		log.Errorf("follow likes, maintenance mode: limited functionality")
-	} else {
-		go fl.refresher()
-		go fl.janitor()
-	}
+	/*
+		if s.Maintenance {
+			log.Errorf("follow likes, maintenance mode: limited functionality")
+		} else {
+			go fl.refresher()
+			go fl.janitor()
+		}
+	*/
 
 	return fl
 }
@@ -347,54 +347,60 @@ func (f *FollowLikes) getLikedPostsFallback(ctx context.Context, u *User) ([]uin
 	return postids, nil
 }
 func (f *FollowLikes) GetFeed(ctx context.Context, u *User, lim int, curs *string) (*bsky.FeedGetFeedSkeleton_Output, error) {
-	if !u.HasFollowsScraped() {
-		if err := f.s.scrapeFollowsForUser(ctx, u); err != nil {
+	/*
+		if !u.HasFollowsScraped() {
+			if err := f.s.scrapeFollowsForUser(ctx, u); err != nil {
+				return nil, err
+			}
+		}
+
+		postids, err := f.getLikedPostsAboveThreshold(ctx, u, 3)
+		if err != nil {
 			return nil, err
 		}
-	}
 
-	postids, err := f.getLikedPostsAboveThreshold(ctx, u, 3)
-	if err != nil {
-		return nil, err
-	}
-
-	var start int
-	if curs != nil {
-		n, err := strconv.Atoi(*curs)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse cursor: %w", err)
+		var start int
+		if curs != nil {
+			n, err := strconv.Atoi(*curs)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse cursor: %w", err)
+			}
+			start = n
 		}
-		start = n
+
+		if len(postids) <= start {
+			postids = postids[:0]
+		} else {
+			postids = postids[start:]
+		}
+
+		if len(postids) > lim {
+			postids = postids[:lim]
+		}
+
+		var fposts []PostRef
+		if err := f.s.db.Debug().Find(&fposts, "id in (?)", postids).Error; err != nil {
+			return nil, err
+		}
+
+		sort.Slice(fposts, func(i, j int) bool {
+			return fposts[i].CreatedAt.After(fposts[j].CreatedAt)
+		})
+
+		skelposts, err := f.s.postsToFeed(ctx, fposts)
+		if err != nil {
+			return nil, err
+		}
+	*/
+
+	out := []*bsky.FeedDefs_SkeletonFeedPost{
+		{
+			Post: "at://did:plc:vpkhqolt662uhesyj6nxm7ys/app.bsky.feed.post/3lbfifkwv522t",
+		},
 	}
 
-	if len(postids) <= start {
-		postids = postids[:0]
-	} else {
-		postids = postids[start:]
-	}
-
-	if len(postids) > lim {
-		postids = postids[:lim]
-	}
-
-	var fposts []PostRef
-	if err := f.s.db.Debug().Find(&fposts, "id in (?)", postids).Error; err != nil {
-		return nil, err
-	}
-
-	sort.Slice(fposts, func(i, j int) bool {
-		return fposts[i].CreatedAt.After(fposts[j].CreatedAt)
-	})
-
-	skelposts, err := f.s.postsToFeed(ctx, fposts)
-	if err != nil {
-		return nil, err
-	}
-
-	c := fmt.Sprint(start + len(postids))
 	return &bsky.FeedGetFeedSkeleton_Output{
-		Cursor: &c,
-		Feed:   skelposts,
+		Feed: out,
 	}, nil
 }
 

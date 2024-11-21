@@ -33,6 +33,7 @@ func (f *DevFeed) GetFeed(ctx context.Context, u *User, limit int, cursor *strin
 }
 
 var devwords = []string{
+	"api",
 	"github",
 	"postgres",
 	"postgresql",

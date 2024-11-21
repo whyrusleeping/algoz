@@ -3,9 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
@@ -16,6 +20,9 @@ import (
 	lexutil "github.com/bluesky-social/indigo/lex/util"
 	"github.com/bluesky-social/indigo/repo"
 	"github.com/bluesky-social/indigo/repomgr"
+	"github.com/bluesky-social/jetstream/pkg/client"
+	jpar "github.com/bluesky-social/jetstream/pkg/client/schedulers/parallel"
+	"github.com/bluesky-social/jetstream/pkg/models"
 	"github.com/gorilla/websocket"
 	"github.com/ipfs/go-cid"
 	. "github.com/whyrusleeping/algoz/models"
@@ -57,6 +64,125 @@ func (s *Server) updateLastCursor(curs int64) error {
 	return nil
 }
 
+func (s *Server) RunJetstream(ctx context.Context) error {
+	loadedCursor, err := s.loadCursor()
+	if err != nil {
+		return fmt.Errorf("get last cursor: %w", err)
+	}
+
+	s.cursor = loadedCursor
+
+	handleFunc := func(ctx context.Context, evt *models.Event) error {
+		did := evt.Did
+
+		switch {
+		case evt.Commit != nil:
+			c := evt.Commit
+
+			if !interestedInRecordType(c.Collection) {
+				return nil
+			}
+
+			ek := repomgr.EventKind(c.Operation)
+			switch ek {
+			case repomgr.EvtKindCreateRecord, repomgr.EvtKindUpdateRecord:
+				var rec any
+				switch c.Collection {
+				case "app.bsky.feed.post":
+					var r bsky.FeedPost
+					if err := json.Unmarshal([]byte(c.Record), &r); err != nil {
+						return err
+					}
+					rec = &r
+				case "app.bsky.actor.profile":
+					var r bsky.ActorProfile
+					if err := json.Unmarshal([]byte(c.Record), &r); err != nil {
+						return err
+					}
+					rec = &r
+				case "app.bsky.feed.like":
+					var r bsky.FeedLike
+					if err := json.Unmarshal([]byte(c.Record), &r); err != nil {
+						return err
+					}
+					rec = &r
+				case "app.bsky.feed.repost":
+					var r bsky.FeedRepost
+					if err := json.Unmarshal([]byte(c.Record), &r); err != nil {
+						return err
+					}
+					rec = &r
+				case "app.bsky.graph.follow":
+					var r bsky.GraphFollow
+					if err := json.Unmarshal([]byte(c.Record), &r); err != nil {
+						return err
+					}
+					rec = &r
+				case "app.bsky.graph.block":
+					var r bsky.GraphBlock
+					if err := json.Unmarshal([]byte(c.Record), &r); err != nil {
+						return err
+					}
+					rec = &r
+				default:
+					return nil
+				}
+				if err := s.handleOp(ctx, ek, evt.TimeUS, c.Collection+"/"+c.RKey, did, nil, rec); err != nil {
+					log.Errorf("failed to handle op: %s", err)
+					return nil
+				}
+
+			case repomgr.EvtKindDeleteRecord:
+				if err := s.handleOp(ctx, ek, evt.TimeUS, c.Collection+"/"+c.RKey, did, nil, nil); err != nil {
+					if !errors.Is(err, ErrMissingDeleteTarget) {
+						log.Errorf("failed to handle delete: %s", err)
+					}
+					return nil
+				}
+			}
+
+			return nil
+			/*
+				case evt.Account != nil:
+					evt := evt.Account
+					if err := s.updateUserHandle(ctx, evt.Did, evt.Handle); err != nil {
+						log.Errorf("failed to update user handle: %s", err)
+					}
+					return nil
+			*/
+		case evt.Identity != nil:
+			evt := evt.Identity
+			if err := s.directory.Purge(ctx, syntax.AtIdentifier{
+				Inner: syntax.DID(evt.Did),
+			}); err != nil {
+				log.Errorf("failed to purge identity: %s", err)
+			}
+			s.keyCache.Remove(evt.Did)
+			return nil
+		default:
+			return nil
+		}
+	}
+
+	for {
+
+		l := slog.Default()
+		sched := jpar.NewScheduler(100, "algoz", l, handleFunc)
+		cfg := client.DefaultClientConfig()
+		cfg.WebsocketURL = "wss://jetstream1.us-west.bsky.network/subscribe"
+
+		jcli, err := client.NewClient(cfg, l, sched)
+		if err != nil {
+			log.Error("failed to setup jetstream client: ", err)
+			continue
+		}
+
+		if err := jcli.ConnectAndRead(ctx, &s.cursor); err != nil {
+			log.Errorf("stream processing error: %s", err)
+		}
+	}
+}
+
 func (s *Server) Run(ctx context.Context) error {
 	loadedCursor, err := s.loadCursor()
 	if err != nil {
@@ -65,7 +191,14 @@ func (s *Server) Run(ctx context.Context) error {
 
 	s.cursor = loadedCursor
 
+	var lelk sync.Mutex
+	lastTime := time.Now()
+
 	handleFunc := func(ctx context.Context, xe *events.XRPCStreamEvent) error {
+		lelk.Lock()
+		lastTime = time.Now()
+		lelk.Unlock()
+
 		switch {
 		case xe.RepoCommit != nil:
 			evt := xe.RepoCommit
@@ -117,7 +250,9 @@ func (s *Server) Run(ctx context.Context) error {
 
 				case repomgr.EvtKindDeleteRecord:
 					if err := s.handleOp(ctx, ek, evt.Seq, op.Path, evt.Repo, nil, nil); err != nil {
-						log.Errorf("failed to handle delete: %s", err)
+						if !errors.Is(err, ErrMissingDeleteTarget) {
+							log.Errorf("failed to handle delete: %s", err)
+						}
 						return nil
 					}
 				}
@@ -129,6 +264,15 @@ func (s *Server) Run(ctx context.Context) error {
 			if err := s.updateUserHandle(ctx, evt.Did, evt.Handle); err != nil {
 				log.Errorf("failed to update user handle: %s", err)
 			}
+			return nil
+		case xe.RepoIdentity != nil:
+			evt := xe.RepoIdentity
+			if err := s.directory.Purge(ctx, syntax.AtIdentifier{
+				Inner: syntax.DID(evt.Did),
+			}); err != nil {
+				log.Errorf("failed to purge identity: %s", err)
+			}
+			s.keyCache.Remove(evt.Did)
 			return nil
 		default:
 			return nil
@@ -151,7 +295,20 @@ func (s *Server) Run(ctx context.Context) error {
 
 		backoff = 0
 
-		sched := parallel.NewScheduler(100, 1000, con.RemoteAddr().String(), handleFunc)
+		go func() {
+			for range time.Tick(time.Second) {
+				lelk.Lock()
+				t := lastTime
+				lelk.Unlock()
+
+				if time.Since(t) > time.Second*30 {
+					con.Close()
+					return
+				}
+			}
+		}()
+
+		sched := parallel.NewScheduler(150, 1000, con.RemoteAddr().String(), handleFunc)
 		if err := events.HandleRepoStream(ctx, con, sched); err != nil {
 			log.Errorf("stream processing error: %s", err)
 		}
@@ -186,7 +343,7 @@ func (s *Server) handleOp(ctx context.Context, op repomgr.EventKind, seq int64, 
 		}
 		switch rec := rec.(type) {
 		case *bsky.FeedPost:
-			if err := s.indexPost(ctx, u, rec, path, *rcid); err != nil {
+			if err := s.indexPost(ctx, u, rec, path); err != nil {
 				return fmt.Errorf("indexing post: %w", err)
 			}
 		case *bsky.ActorProfile:
@@ -357,6 +514,10 @@ func (s *Server) Cleanup(epoch time.Time) error {
 	}
 
 	if err := s.db.Exec("delete from feed_incls where created_at < ?", epoch).Error; err != nil {
+		return err
+	}
+
+	if err := s.db.Exec("delete from quiet_posts where created_at < ?", epoch).Error; err != nil {
 		return err
 	}
 
