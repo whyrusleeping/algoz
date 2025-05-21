@@ -907,7 +907,7 @@ func (s *Server) getMostRecentFromFollows(ctx context.Context, u *User, limit in
 	}
 
 	var fuids []uint
-	if err := s.db.Raw("SELECT following FROM follows WHERE uid = ?", u.ID).Scan(&fuids).Error; err != nil {
+	if err := s.db.Raw("SELECT following FROM follows WHERE uid = ? limit 5000", u.ID).Scan(&fuids).Error; err != nil {
 		return nil, nil, err
 	}
 

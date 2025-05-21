@@ -231,6 +231,11 @@ func (s *Server) Run(ctx context.Context) error {
 				ek := repomgr.EventKind(op.Action)
 				switch ek {
 				case repomgr.EvtKindCreateRecord, repomgr.EvtKindUpdateRecord:
+					if op.Cid == nil {
+						log.Errorf("invalid op, nil cid")
+						return nil
+					}
+
 					rc, rec, err := r.GetRecord(ctx, op.Path)
 					if err != nil {
 						e := fmt.Errorf("getting record %s (%s) within seq %d for %s: %w", op.Path, *op.Cid, evt.Seq, evt.Repo, err)
