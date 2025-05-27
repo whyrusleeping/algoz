@@ -102,7 +102,8 @@ func (f *DevFeed) userIsDev(ctx context.Context, u *User) (bool, error) {
 }
 
 func (f *DevFeed) HandlePost(ctx context.Context, u *User, pr *PostRef, fp *bsky.FeedPost) error {
-	if strings.Contains(fp.Text, "#atdev") || strings.Contains(fp.Text, "#atproto") || strings.Contains(fp.Text, "github.com/bluesky-social") {
+	var fpText = strings.ToLower(fp.Text)
+	if strings.Contains(fpText, "#atdev") || strings.Contains(fpText, "#atproto") || strings.Contains(fpText, "github.com/bluesky-social") {
 		if err := f.s.addPostToFeed(ctx, "devfeed", pr.ID); err != nil {
 			return err
 		}
