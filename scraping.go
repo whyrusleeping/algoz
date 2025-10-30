@@ -26,6 +26,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/ipfs/go-cid"
 	. "github.com/whyrusleeping/algoz/models"
+	gorm "gorm.io/gorm"
 )
 
 func (s *Server) loadCursor() (int64, error) {
@@ -501,7 +502,7 @@ func (s *Server) handleFromDid(ctx context.Context, did string) (string, error) 
 	return resp.Handle.String(), nil
 }
 
-func (s *Server) Cleanup(epoch time.Time) error {
+func (s *Server) CleanupOld(epoch time.Time) error {
 	if err := s.db.Exec("delete from post_texts where created_at < ?", epoch).Error; err != nil {
 		return err
 	}
@@ -533,11 +534,90 @@ func (s *Server) Cleanup(epoch time.Time) error {
 	return nil
 }
 
+func (s *Server) Cleanup(epoch time.Time) error {
+	if err := s.db.Exec("delete from feed_likes where rkey < ?", TID(epoch)).Error; err != nil {
+		return fmt.Errorf("cleanup feed_likes: %w", err)
+	}
+
+	if err := s.cleanupPostRefs(epoch); err != nil {
+		return fmt.Errorf("cleanup post_refs: %w", err)
+	}
+
+	if err := s.db.Exec("delete from feed_reposts where rkey < ?", TID(epoch)).Error; err != nil {
+		return fmt.Errorf("cleanup reposts: %w", err)
+	}
+
+	if err := s.cleanupFeedIncls(epoch); err != nil {
+		return fmt.Errorf("cleanup post_refs: %w", err)
+	}
+
+	/*
+		if err := s.db.Exec("vacuum").Error; err != nil {
+			return fmt.Errorf("cleanup vacuum: %w", err)
+		}
+	*/
+
+	return nil
+}
+
+func (s *Server) cleanupFeedIncls(epoch time.Time) error {
+	var failures int
+	for {
+		ses := s.db.Session(&gorm.Session{SkipDefaultTransaction: true})
+		oq := ses.Exec("DELETE FROM feed_incls WHERE id IN (SELECT id FROM feed_incls WHERE created_at < ? LIMIT 5000)", epoch)
+		if err := oq.Error; err != nil {
+			if strings.Contains(err.Error(), "deadlock") {
+				slog.Error("got a sql deadlock error", "table", "feed_incls", "err", err, "failures", failures)
+				failures++
+				if failures > 10 {
+					return fmt.Errorf("too many deadlock failures, trying again later")
+				}
+				time.Sleep(time.Second)
+				continue
+			}
+
+			return err
+		}
+
+		if oq.RowsAffected < 4000 {
+			return nil
+		}
+	}
+}
+
+func (s *Server) cleanupPostRefs(epoch time.Time) error {
+	var failures int
+	for {
+		ses := s.db.Session(&gorm.Session{SkipDefaultTransaction: true})
+		oq := ses.Exec("DELETE FROM post_refs WHERE id IN (SELECT id FROM post_refs WHERE created_at < ? LIMIT 5000)", epoch)
+		if err := oq.Error; err != nil {
+			if strings.Contains(err.Error(), "deadlock") {
+				slog.Error("got a sql deadlock error", "table", "post_refs", "err", err, "failures", failures)
+				failures++
+				if failures > 10 {
+					return fmt.Errorf("too many deadlock failures, trying again later")
+				}
+				time.Sleep(time.Second)
+				continue
+			}
+
+			return err
+		}
+
+		if oq.RowsAffected < 4000 {
+			return nil
+		}
+	}
+}
+
 func (s *Server) CleanupRoutine() {
 	oneMonth := time.Hour * 24 * 30
 	for range time.Tick(time.Hour) {
+		start := time.Now()
 		if err := s.Cleanup(time.Now().Add(-1 * oneMonth)); err != nil {
-			log.Errorf("cleanup failed: %s", err)
+			slog.Error("cleanup failed", "err", err, "took", time.Since(start))
+		} else {
+			slog.Info("cleanup finished", "took", time.Since(start))
 		}
 	}
 }

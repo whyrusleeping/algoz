@@ -441,6 +441,8 @@ var runCmd = &cli.Command{
 			select {}
 		}
 
+		go s.CleanupRoutine()
+
 		ctx := context.TODO()
 		//if err := s.Run(ctx); err != nil {
 		if err := s.RunJetstream(ctx); err != nil {
@@ -587,6 +589,10 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 
 	if authedUser == nil {
 		return fmt.Errorf("auth required")
+	}
+
+	if authedUser.Blocked {
+		return fmt.Errorf("user blocked")
 	}
 
 	var limit int = 100
