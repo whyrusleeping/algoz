@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"crypto"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	_ "net/http/pprof"
@@ -102,6 +104,13 @@ type PostText struct {
 	gorm.Model
 	Post uint `gorm:"uniqueIndex"`
 	Text string
+}
+
+type ClusterRecord struct {
+	gorm.Model
+	Uid        uint `gorm:"index"`
+	Cluster    uint `gorm:"index"`
+	Influencer bool
 }
 
 func main() {
@@ -221,6 +230,7 @@ var runCmd = &cli.Command{
 			db.AutoMigrate(&PostText{})
 			db.AutoMigrate(&PostCountTask{})
 			db.AutoMigrate(&QuietPost{})
+			db.AutoMigrate(&ClusterRecord{})
 		}
 
 		log.Infof("Configuring HTTP server")
@@ -397,6 +407,9 @@ var runCmd = &cli.Command{
 		mixtopicsuri := "at://" + middlebit + "topicmix"
 		s.AddFeedBuilder(mixtopicsuri, NewTopicMixer(s))
 
+		simclustersuri := "at://" + middlebit + "simclusters"
+		s.AddFeedBuilder(simclustersuri, &SimclustersFeed{s})
+
 		if !maintenance {
 			for _, f := range s.feeds {
 				if err := s.db.Create(&models.Feed{
@@ -434,6 +447,7 @@ var runCmd = &cli.Command{
 
 		go func() {
 			http.Handle("/metrics", promhttp.Handler())
+			http.HandleFunc("/update-clusters", s.handleUpdateClusters)
 			http.ListenAndServe(":5252", nil)
 		}()
 
@@ -1664,4 +1678,118 @@ func (s *Server) handleBlock(ctx context.Context, u *User, rec *bsky.GraphBlock,
 	}
 
 	return nil
+}
+
+func (s *Server) handleUpdateClusters(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse the multipart form
+	if err := r.ParseMultipartForm(32 << 20); err != nil { // 32 MB max
+		http.Error(w, fmt.Sprintf("failed to parse form: %s", err), http.StatusBadRequest)
+		return
+	}
+
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to read file: %s", err), http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	// Read and parse CSV
+	reader := csv.NewReader(file)
+
+	// Read header
+	header, err := reader.Read()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to read CSV header: %s", err), http.StatusBadRequest)
+		return
+	}
+
+	// Validate header
+	expectedHeader := []string{"DID", "communityID", "is_influencer", "score"}
+	for i, h := range expectedHeader {
+		if i >= len(header) || header[i] != h {
+			http.Error(w, fmt.Sprintf("invalid CSV header, expected %v", expectedHeader), http.StatusBadRequest)
+			return
+		}
+	}
+
+	recordCount := 0
+	errorCount := 0
+
+	// Process each row
+	var records []*ClusterRecord
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Errorf("error reading CSV row: %s", err)
+			errorCount++
+			continue
+		}
+
+		if len(record) < 4 {
+			log.Warnf("skipping invalid row: %v", record)
+			errorCount++
+			continue
+		}
+
+		did := record[0]
+		communityIDStr := record[1]
+		isInfluencerStr := record[2]
+		// score := record[3] // not currently used
+
+		// Parse community ID
+		communityID, err := strconv.ParseUint(communityIDStr, 10, 32)
+		if err != nil {
+			log.Errorf("invalid community ID %s: %s", communityIDStr, err)
+			errorCount++
+			continue
+		}
+
+		// Parse is_influencer
+		isInfluencer := strings.ToLower(isInfluencerStr) == "true"
+
+		// Map DID to user ID
+		user, err := s.getOrCreateUser(ctx, did)
+		if err != nil {
+			log.Errorf("failed to get user for DID %s: %s", did, err)
+			errorCount++
+			continue
+		}
+
+		// Create ClusterRecord
+		clusterRecord := ClusterRecord{
+			Uid:        user.ID,
+			Cluster:    uint(communityID),
+			Influencer: isInfluencer,
+		}
+
+		records = append(records, &clusterRecord)
+
+		recordCount++
+	}
+
+	if err := s.db.CreateInBatches(records, 5000).Error; err != nil {
+		log.Errorf("failed to create records", "error", err)
+		return
+	}
+
+	log.Infof("processed %d cluster records with %d errors", recordCount, errorCount)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"records": recordCount,
+		"errors":  errorCount,
+		"message": fmt.Sprintf("Successfully processed %d records", recordCount),
+	})
 }
