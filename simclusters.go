@@ -2,16 +2,40 @@ package main
 
 import (
 	"context"
-	"slices"
 	"time"
 
 	bsky "github.com/bluesky-social/indigo/api/bsky"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/whyrusleeping/algoz/models"
 	. "github.com/whyrusleeping/algoz/models"
 )
 
 type SimclustersFeed struct {
 	s *Server
+
+	postsCache    *lru.TwoQueueCache[uint, *clusterPostsCache]
+	clustersCache *lru.TwoQueueCache[uint, *userClustersCache]
+}
+
+func NewSimclustersFeed(s *Server) *SimclustersFeed {
+	pc, _ := lru.New2Q[uint, *clusterPostsCache](15000)
+	uc, _ := lru.New2Q[uint, *userClustersCache](50000)
+
+	return &SimclustersFeed{
+		s:             s,
+		postsCache:    pc,
+		clustersCache: uc,
+	}
+}
+
+type clusterPostsCache struct {
+	CachedAt time.Time
+	Posts    []*models.PostRef
+}
+
+type userClustersCache struct {
+	CachedAt time.Time
+	Clusters []uint
 }
 
 func (f *SimclustersFeed) Name() string {
@@ -23,21 +47,40 @@ func (f *SimclustersFeed) Description() string {
 }
 
 func (f *SimclustersFeed) postsForCluster(ctx context.Context, c uint) ([]*models.PostRef, error) {
+	val, ok := f.postsCache.Get(c)
+	if ok && time.Since(val.CachedAt) < time.Minute {
+		return val.Posts, nil
+	}
+
 	earliest := time.Now().Add(time.Hour * -48)
 
 	var posts []*models.PostRef
-	if err := f.s.db.Raw("SELECT * FROM post_refs WHERE created_at > ? AND uid IN (SELECT uid FROM cluster_records WHERE cluster = ? AND influencer) ORDER BY created_at DESC", earliest, c).Scan(&posts).Error; err != nil {
+	if err := f.s.db.Raw("SELECT * FROM post_refs WHERE created_at > ? AND reply_to = 0 AND uid IN (SELECT uid FROM cluster_records WHERE cluster = ? AND influencer) ORDER BY created_at DESC", earliest, c).Scan(&posts).Error; err != nil {
 		return nil, err
 	}
 
+	f.postsCache.Add(c, &clusterPostsCache{
+		Posts:    posts,
+		CachedAt: time.Now(),
+	})
 	return posts, nil
 }
 
 func (f *SimclustersFeed) clusterInterestsForUser(ctx context.Context, u *User) ([]uint, error) {
+	val, ok := f.clustersCache.Get(u.ID)
+	if ok && time.Since(val.CachedAt) < time.Hour {
+		return val.Clusters, nil
+	}
+
 	var clusters []uint
 	if err := f.s.db.Raw("SELECT cluster FROM cluster_records WHERE uid = ? AND NOT influencer", u.ID).Scan(&clusters).Error; err != nil {
 		return nil, err
 	}
+
+	f.clustersCache.Add(u.ID, &userClustersCache{
+		Clusters: clusters,
+		CachedAt: time.Now(),
+	})
 
 	return clusters, nil
 }
@@ -72,13 +115,16 @@ func (f *SimclustersFeed) GetFeed(ctx context.Context, u *User, limit int, curso
 		}
 	}
 
-	slices.SortFunc(allposts, func(a, b models.PostRef) int {
-		if a.CreatedAt.After(b.CreatedAt) {
-			return -1
-		}
+	hotnessSort(allposts)
+	/*
+		slices.SortFunc(allposts, func(a, b models.PostRef) int {
+			if a.CreatedAt.After(b.CreatedAt) {
+				return -1
+			}
 
-		return 1
-	})
+			return 1
+		})
+	*/
 
 	if len(allposts) > limit {
 		allposts = allposts[:limit]

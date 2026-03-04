@@ -408,7 +408,7 @@ var runCmd = &cli.Command{
 		s.AddFeedBuilder(mixtopicsuri, NewTopicMixer(s))
 
 		simclustersuri := "at://" + middlebit + "simclusters"
-		s.AddFeedBuilder(simclustersuri, &SimclustersFeed{s})
+		s.AddFeedBuilder(simclustersuri, NewSimclustersFeed(s))
 
 		if !maintenance {
 			for _, f := range s.feeds {
@@ -804,9 +804,13 @@ func (s *Server) getMostPop(ctx context.Context, limit int, cursor *string) ([]*
 		return nil, nil, err
 	}
 
-	outcurs := posts[len(posts)-1].CreatedAt.UTC().Format(time.RFC3339)
+	var outcurs *string
+	if len(posts) > 0 {
+		oc := posts[len(posts)-1].CreatedAt.UTC().Format(time.RFC3339)
+		outcurs = &oc
+	}
 
-	return skelposts, &outcurs, nil
+	return skelposts, outcurs, nil
 }
 
 func (s *Server) scrapeFollowsForUser(ctx context.Context, u *User) error {
@@ -1687,7 +1691,6 @@ func (s *Server) handleBlock(ctx context.Context, u *User, rec *bsky.GraphBlock,
 }
 
 func (s *Server) handleUpdateClusters(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
 
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1724,6 +1727,17 @@ func (s *Server) handleUpdateClusters(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("invalid CSV header, expected %v", expectedHeader), http.StatusBadRequest)
 			return
 		}
+	}
+
+	var allUsers []*User
+	if err := s.db.Raw("SELECT id, did FROM users").Scan(&allUsers).Error; err != nil {
+		http.Error(w, fmt.Sprintf("failed to build user map: %s", err), http.StatusBadRequest)
+		return
+	}
+
+	umap := make(map[string]uint, len(allUsers))
+	for _, u := range allUsers {
+		umap[u.Did] = u.ID
 	}
 
 	recordCount := 0
@@ -1764,17 +1778,9 @@ func (s *Server) handleUpdateClusters(w http.ResponseWriter, r *http.Request) {
 		// Parse is_influencer
 		isInfluencer := strings.ToLower(isInfluencerStr) == "true"
 
-		// Map DID to user ID
-		user, err := s.getOrCreateUser(ctx, did)
-		if err != nil {
-			log.Errorf("failed to get user for DID %s: %s", did, err)
-			errorCount++
-			continue
-		}
-
 		// Create ClusterRecord
 		clusterRecord := ClusterRecord{
-			Uid:        user.ID,
+			Uid:        umap[did],
 			Cluster:    uint(communityID),
 			Influencer: isInfluencer,
 		}
