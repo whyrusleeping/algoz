@@ -158,7 +158,7 @@ func (s *Server) RunJetstream(ctx context.Context) error {
 			}); err != nil {
 				log.Errorf("failed to purge identity: %s", err)
 			}
-			s.keyCache.Remove(evt.Did)
+			s.keyCache.Remove(syntax.DID(evt.Did))
 			return nil
 		default:
 			return nil
@@ -278,7 +278,7 @@ func (s *Server) Run(ctx context.Context) error {
 			}); err != nil {
 				log.Errorf("failed to purge identity: %s", err)
 			}
-			s.keyCache.Remove(evt.Did)
+			s.keyCache.Remove(syntax.DID(evt.Did))
 			return nil
 		default:
 			return nil

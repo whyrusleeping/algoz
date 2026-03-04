@@ -546,7 +546,22 @@ func (s *Server) checkJwtConfig(ctx context.Context, tokv string, config ...jwt.
 	p := jwt.NewParser(config...)
 	tok, err := p.Parse(tokv, s.fetchKey)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse auth header JWT: %w", err)
+		// If signature validation failed and we had a cached key, evict it and retry once
+		// This handles the case where a user's key changed (e.g. PDS switch) but we
+		// haven't received the identity event yet
+		p2 := jwt.NewParser(jwt.WithoutClaimsValidation())
+		unverified, _, uerr := p2.ParseUnverified(tokv, jwt.MapClaims{})
+		if uerr == nil {
+			if issuer, ok := unverified.Claims.(jwt.MapClaims)["iss"].(string); ok {
+				did, derr := syntax.ParseDID(issuer)
+				if derr == nil && s.keyCache.Remove(did) {
+					tok, err = p.Parse(tokv, s.fetchKey)
+				}
+			}
+		}
+		if err != nil {
+			return "", fmt.Errorf("failed to parse auth header JWT: %w", err)
+		}
 	}
 	did := tok.Claims.(jwt.MapClaims)["iss"].(string)
 	return did, nil
