@@ -1047,7 +1047,32 @@ func (s *Server) getMostRecentFromMutuals(ctx context.Context, u *User, limit in
 
 func (s *Server) postsToFeed(ctx context.Context, posts []PostRef) ([]*bsky.FeedDefs_SkeletonFeedPost, error) {
 	out := []*bsky.FeedDefs_SkeletonFeedPost{}
+	if len(posts) == 0 {
+		return out, nil
+	}
+
+	uidSet := make(map[uint]struct{}, len(posts))
 	for _, p := range posts {
+		uidSet[p.Uid] = struct{}{}
+	}
+	uids := make([]uint, 0, len(uidSet))
+	for uid := range uidSet {
+		uids = append(uids, uid)
+	}
+
+	var blockedIDs []uint
+	if err := s.db.Model(&User{}).Where("id IN (?) AND blocked = true", uids).Pluck("id", &blockedIDs).Error; err != nil {
+		return nil, err
+	}
+	blocked := make(map[uint]struct{}, len(blockedIDs))
+	for _, id := range blockedIDs {
+		blocked[id] = struct{}{}
+	}
+
+	for _, p := range posts {
+		if _, ok := blocked[p.Uid]; ok {
+			continue
+		}
 		uri, err := s.uriForPost(ctx, &p)
 		if err != nil {
 			return nil, err
@@ -1342,6 +1367,10 @@ func (s *Server) deleteFollow(ctx context.Context, u *User, path string) error {
 
 func (s *Server) indexPost(ctx context.Context, u *User, rec *bsky.FeedPost, path string) error {
 	log.Debugf("indexing post: %s", path)
+
+	if u.Blocked {
+		return nil
+	}
 
 	t, err := time.Parse(util.ISO8601, rec.CreatedAt)
 	if err != nil {
