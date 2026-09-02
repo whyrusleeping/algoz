@@ -5,7 +5,7 @@
 
 ## Environment & tooling
 - 2026-09-02: Production deploys run on SSH host `sirius` from `/home/why/code/algoz` in tmux session `0`, where `always_runalgoz.sh` loops `runalgoz.sh` and the latter launches `./algoz run ... | tee -a algoz.log`.
-- 2026-09-02: Production `runalgoz.sh` currently sets neither `PINNED_POST_URI` nor `--pinned-post-uri`; verify deploys via `https://feeds.bluesky.day/xrpc/app.bsky.feed.describeFeedGenerator`, `/.well-known/did.json`, process uptime, and fresh 200 feed logs.
+- 2026-09-02: For an unpinned deploy, ensure `runalgoz.sh` sets neither `PINNED_POST_URI` nor `--pinned-post-uri`; verify via public describe/DID endpoints, process uptime, and fresh 200 feed logs.
 - 2026-09-02: The sirius checkout's `origin` is now HTTPS and local `master` tracks `origin/master`, so future deploys can use `git pull --ff-only`; local development uses GitHub SSH because HTTPS push hangs.
 - 2026-09-02: Production is pinned to `at://did:plc:eon2iu7v3x2ukgxkqaf7e5np/app.bsky.feed.post/3mukm26duos2c` via `--pinned-post-uri` in sirius `runalgoz.sh`; backup is `runalgoz.sh.before-pin-20260902`.
 
