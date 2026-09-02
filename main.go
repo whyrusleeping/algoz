@@ -146,6 +146,7 @@ type Server struct {
 
 	Maintenance        bool
 	MaintenancePostUri string
+	PinnedPostURI      string
 
 	cursor   int64
 	cursorLk sync.Mutex
@@ -155,6 +156,21 @@ type feedSpec struct {
 	Name        string
 	Uri         string
 	Description string
+}
+
+func validatePinnedPostURI(raw string) error {
+	if raw == "" {
+		return nil
+	}
+
+	uri, err := syntax.ParseATURI(raw)
+	if err != nil {
+		return fmt.Errorf("invalid pinned post URI: %w", err)
+	}
+	if uri.Collection() != syntax.NSID("app.bsky.feed.post") || uri.RecordKey() == "" {
+		return fmt.Errorf("invalid pinned post URI: expected an app.bsky.feed.post record URI")
+	}
+	return nil
 }
 
 var runCmd = &cli.Command{
@@ -200,11 +216,20 @@ var runCmd = &cli.Command{
 		&cli.StringFlag{
 			Name: "qualitea-class-host",
 		},
+		&cli.StringFlag{
+			Name:    "pinned-post-uri",
+			Usage:   "AT-URI of a post to pin to the first page of every feed",
+			EnvVars: []string{"PINNED_POST_URI"},
+		},
 	},
 	Action: func(cctx *cli.Context) error {
 
 		//logging.SetLogLevel("*", "INFO")
 		maintenance := cctx.Bool("maintenance")
+		pinnedPostURI := cctx.String("pinned-post-uri")
+		if err := validatePinnedPostURI(pinnedPostURI); err != nil {
+			return err
+		}
 
 		log.Info("Connecting to database")
 		var db *gorm.DB
@@ -282,6 +307,7 @@ var runCmd = &cli.Command{
 			fbm:                make(map[string]FeedBuilder),
 			Maintenance:        cctx.Bool("maintenance"),
 			MaintenancePostUri: "at://did:plc:vpkhqolt662uhesyj6nxm7ys/app.bsky.feed.post/3kkcyoihzlk2b",
+			PinnedPostURI:      pinnedPostURI,
 			postCache:          pcache,
 			didCache:           dcache,
 		}
@@ -571,17 +597,60 @@ type FeedItem struct {
 	Post string `json:"post"`
 }
 
+func (s *Server) pinPost(out *bsky.FeedGetFeedSkeleton_Output, cursorPresent bool) {
+	if out == nil || cursorPresent || s.PinnedPostURI == "" {
+		return
+	}
+
+	var pinned *bsky.FeedDefs_SkeletonFeedPost
+	feed := make([]*bsky.FeedDefs_SkeletonFeedPost, 0, len(out.Feed)+1)
+	for _, item := range out.Feed {
+		if item != nil && item.Post == s.PinnedPostURI {
+			if pinned == nil {
+				pinned = item
+			}
+			continue
+		}
+		feed = append(feed, item)
+	}
+
+	if pinned == nil {
+		pinned = &bsky.FeedDefs_SkeletonFeedPost{Post: s.PinnedPostURI}
+	}
+	pinned.Reason = &bsky.FeedDefs_SkeletonFeedPost_Reason{
+		FeedDefs_SkeletonReasonPin: &bsky.FeedDefs_SkeletonReasonPin{},
+	}
+	out.Feed = append([]*bsky.FeedDefs_SkeletonFeedPost{pinned}, feed...)
+}
+
+func (s *Server) respondWithFeed(e echo.Context, out *bsky.FeedGetFeedSkeleton_Output, cursorPresent bool) error {
+	s.pinPost(out, cursorPresent)
+	return e.JSON(http.StatusOK, out)
+}
+
+func cursorFromRequest(e echo.Context) (*string, bool) {
+	if _, present := e.QueryParams()["cursor"]; present {
+		value := e.QueryParam("cursor")
+		if value != "" {
+			return &value, true
+		}
+		return nil, true
+	}
+	return nil, false
+}
+
 func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 	ctx, span := otel.Tracer("algoz").Start(e.Request().Context(), "handleGetFeedSkeleton")
 	defer span.End()
 
+	cursor, cursorPresent := cursorFromRequest(e)
+
 	if s.Maintenance {
-		return e.JSON(200, &bsky.FeedGetFeedSkeleton_Output{
+		return s.respondWithFeed(e, &bsky.FeedGetFeedSkeleton_Output{
 			Feed: []*bsky.FeedDefs_SkeletonFeedPost{
 				{Post: s.MaintenancePostUri},
 			},
-		})
-
+		}, cursorPresent)
 	}
 
 	feed := e.QueryParam("feed")
@@ -639,11 +708,6 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 		return err
 	}
 
-	var cursor *string
-	if c := e.QueryParam("cursor"); c != "" {
-		cursor = &c
-	}
-
 	span.SetAttributes(attribute.Bool("cursor", cursor != nil))
 
 	fb, ok := s.fbm[feed]
@@ -656,7 +720,7 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 			}
 		}
 
-		return e.JSON(200, out)
+		return s.respondWithFeed(e, out, cursorPresent)
 	}
 
 	switch puri.Rkey {
@@ -667,10 +731,10 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 			return err
 		}
 
-		return e.JSON(200, &bsky.FeedGetFeedSkeleton_Output{
+		return s.respondWithFeed(e, &bsky.FeedGetFeedSkeleton_Output{
 			Feed:   feed,
 			Cursor: outcurs,
-		})
+		}, cursorPresent)
 	case "topic-art", "topic-gaming", "topic-animals", "topic-dev", "topic-bluesky", "topic-science", "topic-tv", "topic-nature", "topic-writing", "topic-sports", "topic-books", "topic-comics", "topic-music":
 		// all of these feeds are fed by the same 'feed_incls' table
 		feed, outcurs, err := s.getTopicFeed(ctx, puri.Rkey, limit, cursor)
@@ -678,10 +742,10 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 			return err
 		}
 
-		return e.JSON(200, &bsky.FeedGetFeedSkeleton_Output{
+		return s.respondWithFeed(e, &bsky.FeedGetFeedSkeleton_Output{
 			Feed:   feed,
 			Cursor: outcurs,
-		})
+		}, cursorPresent)
 	case "qualitea":
 		//lt := 1
 		feed, outcurs, err := s.getFeed(ctx, puri.Rkey, limit, cursor, nil)
@@ -689,20 +753,20 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 			return err
 		}
 
-		return e.JSON(200, &bsky.FeedGetFeedSkeleton_Output{
+		return s.respondWithFeed(e, &bsky.FeedGetFeedSkeleton_Output{
 			Feed:   feed,
 			Cursor: outcurs,
-		})
+		}, cursorPresent)
 	case "upandup":
 		feed, outcurs, err := s.getFeedAddOrder(ctx, puri.Rkey, limit, cursor)
 		if err != nil {
 			return err
 		}
 
-		return e.JSON(200, &bsky.FeedGetFeedSkeleton_Output{
+		return s.respondWithFeed(e, &bsky.FeedGetFeedSkeleton_Output{
 			Feed:   feed,
 			Cursor: outcurs,
-		})
+		}, cursorPresent)
 	case "mostpop":
 		// mostpop is fed by a sql query over all the posts
 		feed, curs, err := s.getMostPop(ctx, limit, cursor)
@@ -710,10 +774,10 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 			return err
 		}
 
-		return e.JSON(200, &bsky.FeedGetFeedSkeleton_Output{
+		return s.respondWithFeed(e, &bsky.FeedGetFeedSkeleton_Output{
 			Feed:   feed,
 			Cursor: curs,
-		})
+		}, cursorPresent)
 	case "bestoffollows":
 		if authedUser == nil {
 			return &echo.HTTPError{
@@ -726,10 +790,10 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 			return err
 		}
 
-		return e.JSON(200, &bsky.FeedGetFeedSkeleton_Output{
+		return s.respondWithFeed(e, &bsky.FeedGetFeedSkeleton_Output{
 			Feed:   feed,
 			Cursor: outcurs,
-		})
+		}, cursorPresent)
 	case "latestmutuals":
 		if authedUser == nil {
 			return &echo.HTTPError{
@@ -742,10 +806,10 @@ func (s *Server) handleGetFeedSkeleton(e echo.Context) error {
 			return err
 		}
 
-		return e.JSON(200, &bsky.FeedGetFeedSkeleton_Output{
+		return s.respondWithFeed(e, &bsky.FeedGetFeedSkeleton_Output{
 			Feed:   feed,
 			Cursor: outcurs,
-		})
+		}, cursorPresent)
 	default:
 		return &echo.HTTPError{
 			Code:    400,
